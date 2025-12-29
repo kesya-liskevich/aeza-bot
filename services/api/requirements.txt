@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+SQLAlchemy>=2.0
+psycopg2-binary
+alembic
+redis
+aiohttp>=3.12,<4
+python-dotenv
