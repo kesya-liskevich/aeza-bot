@@ -1898,7 +1898,7 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
             car_types = ["tent"]
 
     # 5) Запрос ставок (+ fallback стратегия с лимитом)
-    MAX_TOTAL_REQUESTS = 12          # лимит на average_prices (кузов×НДС)
+    MAX_TOTAL_REQUESTS = 24          # лимит на average_prices (кузов×НДС)
     MAX_CAR_TYPES = 4                # чтобы не раздувать число запросов
     prefer = ["tent", "close", "ref", "docker", "open", "tral"]
 
