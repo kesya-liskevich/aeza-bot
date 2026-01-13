@@ -1830,8 +1830,6 @@ async def ati_collect_full_rates(
 
     return results
 
-
-
 async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
     """
     ЧИСТЫЙ ATI-Pipeline (строго по документации):
@@ -1840,6 +1838,7 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
       3) Нормализуем тоннаж в 1.5/3/5/10/20
       4) Берём доступные кузова для направления+тоннажа из v2/all_directions
       5) Делаем N запросов average_prices (по одному на кузов и НДС/без НДС)
+      6) Если ставок нет — просим GPT подобрать логистические хабы и пробуем по ним
     """
     if not oai_client or not ATI_API_TOKEN:
         log.warning("ATI pipeline: нет OpenAI клиента или ATI токена")
@@ -1888,8 +1887,8 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
         car_types = [c for c in requested if c in available]
         if not car_types:
             # если GPT попросил экзотику — берём 1-2 самых популярных из available
-            prefer = ["tent", "close", "ref", "docker", "open", "tral"]
-            car_types = [c for c in prefer if c in available][:2] or list(available)[:2]
+            prefer_local = ["tent", "close", "ref", "docker", "open", "tral"]
+            car_types = [c for c in prefer_local if c in available][:2] or list(available)[:2]
     else:
         # если all_directions по какой-то причине не загрузился — просто валидируем на допустимые значения
         allowed = {"ref", "close", "open", "tent", "tral", "docker"}
@@ -1922,97 +1921,351 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
         # ati_collect_full_rates по умолчанию ходит в (False, True) => *2
         return len(ctypes) * 2
 
-    attempts: list[dict] = []
+async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
+    """
+    ЧИСТЫЙ ATI-Pipeline (строго по документации):
+      1) GPT нормализует заявку (города + список кузовов + тоннаж)
+      2) Резолвим города в CityId (по нашему кэшу)
+      3) Нормализуем тоннаж в 1.5/3/5/10/20
+      4) Берём доступные кузова для направления+тоннажа из v2/all_directions
+      5) Делаем N запросов average_prices (по одному на кузов и НДС/без НДС)
+      6) Если ставок нет — просим GPT подобрать хабы и повторяем по хабам (быстро, с лимитом)
+    """
+    if not oai_client or not ATI_API_TOKEN:
+        log.warning("ATI pipeline: нет OpenAI клиента или ATI токена")
+        return None
 
-    # attempt #1 — как сейчас (основной)
-    attempts.append({
-        "tonnage": tonnage,
-        "car_types": _pick_car_types(car_types, available if available else None),
-        "reason": "primary",
-    })
+    # ----------------------------
+    # helper: GPT picks nearest hubs
+    # ----------------------------
+    async def _gpt_pick_hubs(from_name: str, to_name: str) -> Optional[dict]:
+        """
+        Возвращает JSON:
+        {
+          "from_hubs": ["Город1","Город2","Город3"],
+          "to_hubs": ["Город1","Город2","Город3"],
+          "why": "коротко почему",
+          "confidence": 0.0
+        }
+        """
+        client = oai_client
+        if client is None:
+            return None
 
-    # attempt #2 — fallback по кузову на том же тоннаже (если первичный запрос был узкий/экзотика)
-    fallback_car_types = _pick_car_types(["tent", "close", "open", "ref"], available if available else None)
-    if fallback_car_types != attempts[0]["car_types"]:
-        attempts.append({
-            "tonnage": tonnage,
-            "car_types": fallback_car_types,
-            "reason": "cartype_fallback",
-        })
+        system = (
+            "Ты — помощник логиста по России/СНГ. "
+            "Нужно подобрать ближайшие логистические хабы для двух населённых пунктов, "
+            "чтобы по этим хабам с высокой вероятностью была статистика ставок грузоперевозок.\n\n"
+            "Верни СТРОГО валидный JSON без пояснений вокруг.\n"
+            "Формат:\n"
+            "{\n"
+            '  "from_hubs": ["Город1","Город2","Город3"],\n'
+            '  "to_hubs":   ["Город1","Город2","Город3"],\n'
+            '  "why": "коротко почему эти хабы",\n'
+            '  "confidence": 0.0\n'
+            "}\n\n"
+            "Требования:\n"
+            "- Только города (без области/района).\n"
+            "- По 3 кандидата на каждую сторону.\n"
+            "- Хабы должны быть крупнее/более транспортными узлами, чем исходные точки.\n"
+            "- Если исходный город уже крупный хаб — допускается вернуть его первым в списке.\n"
+            "- Не придумывай несуществующие города.\n"
+        )
+        user = f"Маршрут: {from_name} → {to_name}. Подбери хабы."
 
-    # attempt #3 — fallback по тоннажу вверх (обычно статистика есть на более массовом классе)
-    # Сетка ATI у тебя уже нормализована, так что безопасный ход — подняться до 20, если не 20.
-    if float(tonnage) != 20.0:
-        fb_tonnage = 20.0
-        fb_avail = await ati_get_available_cartypes_for_direction(from_id, to_id, fb_tonnage, round_trip=False)
-        fb_car_types = _pick_car_types(attempts[0]["car_types"], fb_avail if fb_avail else None)
-
-        attempts.append({
-            "tonnage": fb_tonnage,
-            "car_types": fb_car_types,
-            "reason": "tonnage_to_20",
-        })
-
-    # --- выполняем попытки с бюджетом ---
-    budget = MAX_TOTAL_REQUESTS
-    last_empty = None
-
-    for idx, a in enumerate(attempts, start=1):
-        t = a["tonnage"]
-        ct = a["car_types"]
-        need = _expected_requests(ct)
-
-        if need > budget:
-            log.warning(
-                "ATI: skip attempt #%s (%s) because budget exceeded: need=%s left=%s",
-                idx, a["reason"], need, budget
+        try:
+            resp = client.responses.create(
+                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                input=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.2,
             )
-            continue
+        except Exception as e:
+            log.warning("GPT hubs: request failed: %r", e)
+            return None
 
-        log.info(
-            "ATI TRY #%s (%s): %s→%s tonnage=%s car_types=%s (budget=%s)",
-            idx, a["reason"], from_id, to_id, t, ct, budget
-        )
+        txt = (getattr(resp, "output_text", None) or "").strip()
+        if not txt:
+            return None
 
-        rates = await ati_collect_full_rates(
-            from_id=from_id,
-            to_id=to_id,
-            tonnage=t,
-            car_types=ct,
-        )
+        import json
+        try:
+            data = json.loads(txt)
+        except Exception:
+            log.warning("GPT hubs: cannot parse JSON: %r", txt[:500])
+            return None
 
-        budget -= need
+        if not isinstance(data, dict):
+            return None
 
-        if rates:
+        # normalize
+        fh = data.get("from_hubs") or []
+        th = data.get("to_hubs") or []
+        if not isinstance(fh, list) or not isinstance(th, list):
+            return None
+
+        def _clean_list(xs: list) -> list[str]:
+            out: list[str] = []
+            for x in xs:
+                if not x:
+                    continue
+                s = str(x).strip()
+                if not s:
+                    continue
+                # ограничим длину и число элементов
+                if len(s) > 60:
+                    s = s[:60].strip()
+                if s not in out:
+                    out.append(s)
+                if len(out) >= 3:
+                    break
+            return out
+
+        data["from_hubs"] = _clean_list(fh)
+        data["to_hubs"] = _clean_list(th)
+        data["why"] = str(data.get("why") or "").strip()[:240]
+        try:
+            data["confidence"] = float(data.get("confidence") or 0.0)
+        except Exception:
+            data["confidence"] = 0.0
+
+        if not data["from_hubs"] or not data["to_hubs"]:
+            return None
+
+        return data
+
+    # ----------------------------
+    # helper: run ATI attempts (your current logic) for given cities
+    # ----------------------------
+    async def _run_attempts_for_route(
+        *,
+        from_city_name: str,
+        to_city_name: str,
+        norm_payload: dict,
+        raw_car_types_list: list,
+        raw_tonnage_val,
+        global_budget: int,
+    ) -> tuple[Optional[dict], int, Optional[tuple]]:
+        """
+        Возвращает:
+          (result_dict|None, budget_left, last_empty_tuple|None)
+        last_empty_tuple = (from_id, to_id, tonnage, car_types, reason)
+        """
+        # 2) CityId
+        from_id = await ati_resolve_city_id(from_city_name)
+        to_id = await ati_resolve_city_id(to_city_name)
+        if not from_id or not to_id:
+            log.warning("ATI pipeline: не нашли CityId (%s → %s)", from_city_name, to_city_name)
+            return None, global_budget, None
+
+        # 3) тоннаж
+        raw_tonnage = raw_tonnage_val
+        if raw_tonnage is None:
+            try:
+                if draft.truck_class:
+                    raw_tonnage = float(str(draft.truck_class).replace(",", "."))
+            except Exception:
+                raw_tonnage = None
+
+        tonnage = normalize_ati_tonnage(raw_tonnage or 20)
+
+        # 4) кузова
+        requested = [_ati_normalize_cartype(x) for x in (raw_car_types_list or []) if x]
+        if not requested:
+            requested = ["tent", "close"]
+
+        available = await ati_get_available_cartypes_for_direction(from_id, to_id, tonnage, round_trip=False)
+        if available:
+            car_types = [c for c in requested if c in available]
+            if not car_types:
+                prefer0 = ["tent", "close", "ref", "docker", "open", "tral"]
+                car_types = [c for c in prefer0 if c in available][:2] or list(available)[:2]
+        else:
+            allowed = {"ref", "close", "open", "tent", "tral", "docker"}
+            car_types = [c for c in requested if c in allowed]
+            if not car_types:
+                car_types = ["tent"]
+
+        # 5) attempts with budget limit
+        MAX_TOTAL_REQUESTS = 24          # лимит на average_prices (кузов×НДС)
+        MAX_CAR_TYPES = 4               # чтобы не раздувать число запросов
+        prefer = ["tent", "close", "ref", "docker", "open", "tral"]
+
+        def _pick_car_types(base: list[str], avail: set[str] | None) -> list[str]:
+            """
+            Выбираем до MAX_CAR_TYPES кузовов.
+            Сначала пробуем base, затем popular prefer, затем просто первые из avail.
+            """
+            seen = set()
+            base2 = [c for c in base if c and not (c in seen or seen.add(c))]
+            if avail:
+                primary = [c for c in base2 if c in avail]
+                if primary:
+                    return primary[:MAX_CAR_TYPES]
+                popular = [c for c in prefer if c in avail]
+                return (popular[:MAX_CAR_TYPES] or list(avail)[:MAX_CAR_TYPES])
+            return (base2[:MAX_CAR_TYPES] or ["tent"])
+
+        def _expected_requests(ctypes: list[str]) -> int:
+            return len(ctypes) * 2  # (False, True)
+
+        attempts: list[dict] = []
+        attempts.append({"tonnage": tonnage, "car_types": _pick_car_types(car_types, available if available else None), "reason": "primary"})
+
+        fallback_car_types = _pick_car_types(["tent", "close", "open", "ref"], available if available else None)
+        if fallback_car_types != attempts[0]["car_types"]:
+            attempts.append({"tonnage": tonnage, "car_types": fallback_car_types, "reason": "cartype_fallback"})
+
+        if float(tonnage) != 20.0:
+            fb_tonnage = 20.0
+            fb_avail = await ati_get_available_cartypes_for_direction(from_id, to_id, fb_tonnage, round_trip=False)
+            fb_car_types = _pick_car_types(attempts[0]["car_types"], fb_avail if fb_avail else None)
+            attempts.append({"tonnage": fb_tonnage, "car_types": fb_car_types, "reason": "tonnage_to_20"})
+
+        # бюджеты: локальный и глобальный
+        local_budget = min(MAX_TOTAL_REQUESTS, global_budget)
+        last_empty = None
+
+        for idx, a in enumerate(attempts, start=1):
+            t = a["tonnage"]
+            ct = a["car_types"]
+            need = _expected_requests(ct)
+
+            if need > local_budget:
+                log.warning(
+                    "ATI: skip attempt #%s (%s) because budget exceeded: need=%s left=%s",
+                    idx, a["reason"], need, local_budget
+                )
+                continue
+
             log.info(
-                "ATI OK #%s (%s): got=%s rates; used tonnage=%s car_types=%s",
-                idx, a["reason"], len(rates), t, ct
+                "ATI TRY #%s (%s): %s→%s tonnage=%s car_types=%s (budget=%s)",
+                idx, a["reason"], from_id, to_id, t, ct, local_budget
             )
-            return {
-                "normalized": norm,
-                "from_id": from_id,
-                "to_id": to_id,
-                "tonnage": t,
-                "available_car_types": sorted(list(available)) if available else None,
-                "used_car_types": ct,
-                "rates": rates,
-                "fallback_used": a["reason"] if a["reason"] != "primary" else None,
-            }
 
-        last_empty = (t, ct, a["reason"])
-        log.warning(
-            "ATI EMPTY #%s (%s): %s→%s tonnage=%s car_types=%s (budget_left=%s)",
-            idx, a["reason"], from_id, to_id, t, ct, budget
-        )
+            rates = await ati_collect_full_rates(
+                from_id=from_id,
+                to_id=to_id,
+                tonnage=t,
+                car_types=ct,
+            )
 
-    if last_empty:
-        t, ct, why = last_empty
-        log.warning(
-            "ATI pipeline: no rates after attempts. last=(%s) tonnage=%s car_types=%s",
-            why, t, ct
-        )
+            local_budget -= need
+            global_budget -= need
 
+            if rates:
+                log.info(
+                    "ATI OK #%s (%s): got=%s rates; used tonnage=%s car_types=%s",
+                    idx, a["reason"], len(rates), t, ct
+                )
+                return {
+                    "normalized": norm_payload,
+                    "from_city": from_city_name,
+                    "to_city": to_city_name,
+                    "from_id": from_id,
+                    "to_id": to_id,
+                    "tonnage": t,
+                    "available_car_types": sorted(list(available)) if available else None,
+                    "used_car_types": ct,
+                    "rates": rates,
+                    "fallback_used": a["reason"] if a["reason"] != "primary" else None,
+                }, global_budget, None
+
+            last_empty = (from_id, to_id, t, ct, a["reason"])
+            log.warning(
+                "ATI EMPTY #%s (%s): %s→%s tonnage=%s car_types=%s (budget_left=%s)",
+                idx, a["reason"], from_id, to_id, t, ct, local_budget
+            )
+
+        if last_empty:
+            fid, tid, t, ct, why = last_empty
+            log.warning(
+                "ATI pipeline: no rates after attempts. last=(%s) %s→%s tonnage=%s car_types=%s",
+                why, fid, tid, t, ct
+            )
+
+        return None, global_budget, last_empty
+
+    # ----------------------------
+    # 1) GPT → нормализация
+    # ----------------------------
+    norm = await gpt_prepare_ati_request(draft)
+    if not norm:
+        log.warning("ATI pipeline: GPT вернул None")
+        return None
+
+    from_city = (norm.get("from_city") or draft.route_from or "").strip()
+    to_city = (norm.get("to_city") or draft.route_to or "").strip()
+    raw_car_types = norm.get("car_types") or []
+    raw_tonnage = norm.get("tonnage")
+
+    if not from_city or not to_city:
+        log.warning("ATI pipeline: нет городов (%r → %r)", from_city, to_city)
+        return None
+
+    # ----------------------------
+    # First: try original route (fast)
+    # ----------------------------
+    GLOBAL_BUDGET = 24  # общий лимит запросов average_prices за весь пайплайн (оригинал + хабы)
+    result, GLOBAL_BUDGET, last_empty = await _run_attempts_for_route(
+        from_city_name=from_city,
+        to_city_name=to_city,
+        norm_payload=norm,
+        raw_car_types_list=raw_car_types,
+        raw_tonnage_val=raw_tonnage,
+        global_budget=GLOBAL_BUDGET,
+    )
+    if result:
+        return result
+
+    # ----------------------------
+    # If no rates: try hubs (limited)
+    # ----------------------------
+    # Чтобы не "долго бить" в пустое направление — делаем хабы сразу после пустого исходного маршрута.
+    hubs = await _gpt_pick_hubs(from_city, to_city)
+    if not hubs:
+        log.warning("ATI hubs: GPT не дал хабы (%s → %s)", from_city, to_city)
+        return None
+
+    from_hubs: list[str] = hubs.get("from_hubs") or []
+    to_hubs: list[str] = hubs.get("to_hubs") or []
+
+    log.warning(
+        "ATI HUBS: %s→%s | from_hubs=%s | to_hubs=%s | why=%s",
+        from_city, to_city, from_hubs, to_hubs, hubs.get("why")
+    )
+
+    # Ограничим число комбинаций, чтобы не улететь в запросы
+    # 3x3 = 9 маршрутов, но мы пробуем по порядку и остановимся при успехе/исчерпании бюджета.
+    for fh in from_hubs[:3]:
+        for th in to_hubs[:3]:
+            if fh.strip().lower() == from_city.strip().lower() and th.strip().lower() == to_city.strip().lower():
+                continue  # уже пробовали
+            if GLOBAL_BUDGET <= 0:
+                log.warning("ATI hubs: budget exhausted, stop")
+                return None
+
+            # можно слегка "приглушить" лимит на каждый хаб-маршрут,
+            # но оставим общий GLOBAL_BUDGET как основной стоп-кран.
+            r, GLOBAL_BUDGET, _ = await _run_attempts_for_route(
+                from_city_name=fh,
+                to_city_name=th,
+                norm_payload={**norm, "from_city": fh, "to_city": th, "hubs": hubs},
+                raw_car_types_list=raw_car_types,
+                raw_tonnage_val=raw_tonnage,
+                global_budget=GLOBAL_BUDGET,
+            )
+            if r:
+                # помечаем, что использовали хабы
+                r["hubs_used"] = {"from": fh, "to": th, "hubs_meta": hubs}
+                r["fallback_used"] = (r.get("fallback_used") or "hubs")
+                return r
+
+    log.warning("ATI hubs: no rates for any hub route (%s→%s)", from_city, to_city)
     return None
+
 
 async def estimate_rate_via_ati(draft: QuoteDraft) -> Optional[int]:
     """
