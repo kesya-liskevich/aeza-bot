@@ -1897,28 +1897,122 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
         if not car_types:
             car_types = ["tent"]
 
-    # 5) Запрос ставок
-    rates = await ati_collect_full_rates(
-        from_id=from_id,
-        to_id=to_id,
-        tonnage=tonnage,
-        car_types=car_types,
-    )
+    # 5) Запрос ставок (+ fallback стратегия с лимитом)
+    MAX_TOTAL_REQUESTS = 8           # лимит на average_prices (кузов×НДС)
+    MAX_CAR_TYPES = 2                # чтобы не раздувать число запросов
+    prefer = ["tent", "close", "ref", "docker", "open", "tral"]
 
-    if not rates:
-        log.warning("ATI pipeline: ставки пустые (from_id=%s to_id=%s tonnage=%s car_types=%s)", from_id, to_id, tonnage, car_types)
-        return None
+    def _pick_car_types(base: list[str], avail: set[str] | None) -> list[str]:
+        """
+        Выбираем до MAX_CAR_TYPES кузовов.
+        Сначала пробуем base, затем popular prefer, затем просто первые из avail.
+        """
+        seen = set()
+        base = [c for c in base if c and not (c in seen or seen.add(c))]
+        if avail:
+            primary = [c for c in base if c in avail]
+            if primary:
+                return primary[:MAX_CAR_TYPES]
+            popular = [c for c in prefer if c in avail]
+            return (popular[:MAX_CAR_TYPES] or list(avail)[:MAX_CAR_TYPES])
+        # если avail нет — берём из base, иначе безопасный минимум
+        return (base[:MAX_CAR_TYPES] or ["tent"])
 
-    return {
-        "normalized": norm,
-        "from_id": from_id,
-        "to_id": to_id,
+    def _expected_requests(ctypes: list[str]) -> int:
+        # ati_collect_full_rates по умолчанию ходит в (False, True) => *2
+        return len(ctypes) * 2
+
+    attempts: list[dict] = []
+
+    # attempt #1 — как сейчас (основной)
+    attempts.append({
         "tonnage": tonnage,
-        "available_car_types": sorted(list(available)) if available else None,
-        "used_car_types": car_types,
-        "rates": rates,
-    }
+        "car_types": _pick_car_types(car_types, available if available else None),
+        "reason": "primary",
+    })
 
+    # attempt #2 — fallback по кузову на том же тоннаже (если первичный запрос был узкий/экзотика)
+    fallback_car_types = _pick_car_types(["tent", "close", "open", "ref"], available if available else None)
+    if fallback_car_types != attempts[0]["car_types"]:
+        attempts.append({
+            "tonnage": tonnage,
+            "car_types": fallback_car_types,
+            "reason": "cartype_fallback",
+        })
+
+    # attempt #3 — fallback по тоннажу вверх (обычно статистика есть на более массовом классе)
+    # Сетка ATI у тебя уже нормализована, так что безопасный ход — подняться до 20, если не 20.
+    if float(tonnage) != 20.0:
+        fb_tonnage = 20.0
+        fb_avail = await ati_get_available_cartypes_for_direction(from_id, to_id, fb_tonnage, round_trip=False)
+        fb_car_types = _pick_car_types(attempts[0]["car_types"], fb_avail if fb_avail else None)
+
+        attempts.append({
+            "tonnage": fb_tonnage,
+            "car_types": fb_car_types,
+            "reason": "tonnage_to_20",
+        })
+
+    # --- выполняем попытки с бюджетом ---
+    budget = MAX_TOTAL_REQUESTS
+    last_empty = None
+
+    for idx, a in enumerate(attempts, start=1):
+        t = a["tonnage"]
+        ct = a["car_types"]
+        need = _expected_requests(ct)
+
+        if need > budget:
+            log.warning(
+                "ATI: skip attempt #%s (%s) because budget exceeded: need=%s left=%s",
+                idx, a["reason"], need, budget
+            )
+            continue
+
+        log.info(
+            "ATI TRY #%s (%s): %s→%s tonnage=%s car_types=%s (budget=%s)",
+            idx, a["reason"], from_id, to_id, t, ct, budget
+        )
+
+        rates = await ati_collect_full_rates(
+            from_id=from_id,
+            to_id=to_id,
+            tonnage=t,
+            car_types=ct,
+        )
+
+        budget -= need
+
+        if rates:
+            log.info(
+                "ATI OK #%s (%s): got=%s rates; used tonnage=%s car_types=%s",
+                idx, a["reason"], len(rates), t, ct
+            )
+            return {
+                "normalized": norm,
+                "from_id": from_id,
+                "to_id": to_id,
+                "tonnage": t,
+                "available_car_types": sorted(list(available)) if available else None,
+                "used_car_types": ct,
+                "rates": rates,
+                "fallback_used": a["reason"] if a["reason"] != "primary" else None,
+            }
+
+        last_empty = (t, ct, a["reason"])
+        log.warning(
+            "ATI EMPTY #%s (%s): %s→%s tonnage=%s car_types=%s (budget_left=%s)",
+            idx, a["reason"], from_id, to_id, t, ct, budget
+        )
+
+    if last_empty:
+        t, ct, why = last_empty
+        log.warning(
+            "ATI pipeline: no rates after attempts. last=(%s) tonnage=%s car_types=%s",
+            why, t, ct
+        )
+
+    return None
 
 async def estimate_rate_via_ati(draft: QuoteDraft) -> Optional[int]:
     """
