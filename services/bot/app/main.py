@@ -1936,105 +1936,103 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
         return None
 
     # ----------------------------
-    # helper: GPT picks nearest hubs
-    # ----------------------------
-    async def _gpt_pick_hubs(from_name: str, to_name: str) -> Optional[dict]:
-        """
-        Возвращает JSON:
-        {
-          "from_hubs": ["Город1","Город2","Город3"],
-          "to_hubs": ["Город1","Город2","Город3"],
-          "why": "коротко почему",
-          "confidence": 0.0
-        }
-        """
-        client = oai_client
-        if client is None:
-            return None
+# helper: GPT picks nearest hubs
+# ----------------------------
+async def _gpt_pick_hubs(from_name: str, to_name: str) -> Optional[dict]:
+    """
+    Возвращает JSON:
+    {
+      "from_hubs": ["Город1","Город2","Город3"],
+      "to_hubs": ["Город1","Город2","Город3"],
+      "why": "коротко почему",
+      "confidence": 0.0
+    }
+    """
+    client = oai_client
+    if client is None:
+        return None
 
-        system = (
-            "Ты — помощник логиста по России/СНГ. "
-            "Нужно подобрать ближайшие логистические хабы для двух населённых пунктов, "
-            "чтобы по этим хабам с высокой вероятностью была статистика ставок грузоперевозок.\n\n"
-            "Верни СТРОГО валидный JSON без пояснений вокруг.\n"
-            "Формат:\n"
-            "{\n"
-            '  "from_hubs": ["Город1","Город2","Город3"],\n'
-            '  "to_hubs":   ["Город1","Город2","Город3"],\n'
-            '  "why": "коротко почему эти хабы",\n'
-            '  "confidence": 0.0\n'
-            "}\n\n"
-            "Требования:\n"
-            "- Только города (без области/района).\n"
-            "- По 3 кандидата на каждую сторону.\n"
-            "- Хабы должны быть крупнее/более транспортными узлами, чем исходные точки.\n"
-            "- Если исходный город уже крупный хаб — допускается вернуть его первым в списке.\n"
-            "- Не придумывай несуществующие города.\n"
+    system = (
+        "Ты — помощник логиста по России/СНГ. "
+        "Нужно подобрать ближайшие логистические хабы для двух населённых пунктов, "
+        "чтобы по этим хабам с высокой вероятностью была статистика ставок грузоперевозок.\n\n"
+        "Верни СТРОГО валидный JSON без пояснений вокруг.\n"
+        "Формат:\n"
+        "{\n"
+        '  "from_hubs": ["Город1","Город2","Город3"],\n'
+        '  "to_hubs":   ["Город1","Город2","Город3"],\n'
+        '  "why": "коротко почему эти хабы",\n'
+        '  "confidence": 0.0\n'
+        "}\n\n"
+        "Требования:\n"
+        "- Только города (без области/района).\n"
+        "- По 3 кандидата на каждую сторону.\n"
+        "- Хабы должны быть крупнее/более транспортными узлами, чем исходные точки.\n"
+        "- Если исходный город уже крупный хаб — допускается вернуть его первым в списке.\n"
+        "- Не придумывай несуществующие города.\n"
+    )
+    user = f"Маршрут: {from_name} → {to_name}. Подбери хабы."
+
+    try:
+        resp = await client.responses.create(   # ✅ ВОТ ЭТО КРИТИЧНО
+            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.2,
         )
-        user = f"Маршрут: {from_name} → {to_name}. Подбери хабы."
+    except Exception as e:
+        log.warning("GPT hubs: request failed: %r", e)
+        return None
 
-        try:
-            resp = client.responses.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                input=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=0.2,
-            )
-        except Exception as e:
-            log.warning("GPT hubs: request failed: %r", e)
-            return None
+    txt = (getattr(resp, "output_text", None) or "").strip()
+    if not txt:
+        return None
 
-        txt = (getattr(resp, "output_text", None) or "").strip()
-        if not txt:
-            return None
+    import json
+    try:
+        data = json.loads(txt)
+    except Exception:
+        log.warning("GPT hubs: cannot parse JSON: %r", txt[:500])
+        return None
 
-        import json
-        try:
-            data = json.loads(txt)
-        except Exception:
-            log.warning("GPT hubs: cannot parse JSON: %r", txt[:500])
-            return None
+    if not isinstance(data, dict):
+        return None
 
-        if not isinstance(data, dict):
-            return None
+    fh = data.get("from_hubs") or []
+    th = data.get("to_hubs") or []
+    if not isinstance(fh, list) or not isinstance(th, list):
+        return None
 
-        # normalize
-        fh = data.get("from_hubs") or []
-        th = data.get("to_hubs") or []
-        if not isinstance(fh, list) or not isinstance(th, list):
-            return None
+    def _clean_list(xs: list) -> list[str]:
+        out: list[str] = []
+        for x in xs:
+            if not x:
+                continue
+            s = str(x).strip()
+            if not s:
+                continue
+            if len(s) > 60:
+                s = s[:60].strip()
+            if s not in out:
+                out.append(s)
+            if len(out) >= 3:
+                break
+        return out
 
-        def _clean_list(xs: list) -> list[str]:
-            out: list[str] = []
-            for x in xs:
-                if not x:
-                    continue
-                s = str(x).strip()
-                if not s:
-                    continue
-                # ограничим длину и число элементов
-                if len(s) > 60:
-                    s = s[:60].strip()
-                if s not in out:
-                    out.append(s)
-                if len(out) >= 3:
-                    break
-            return out
+    data["from_hubs"] = _clean_list(fh)
+    data["to_hubs"] = _clean_list(th)
+    data["why"] = str(data.get("why") or "").strip()[:240]
+    try:
+        data["confidence"] = float(data.get("confidence") or 0.0)
+    except Exception:
+        data["confidence"] = 0.0
 
-        data["from_hubs"] = _clean_list(fh)
-        data["to_hubs"] = _clean_list(th)
-        data["why"] = str(data.get("why") or "").strip()[:240]
-        try:
-            data["confidence"] = float(data.get("confidence") or 0.0)
-        except Exception:
-            data["confidence"] = 0.0
+    if not data["from_hubs"] or not data["to_hubs"]:
+        return None
 
-        if not data["from_hubs"] or not data["to_hubs"]:
-            return None
-
-        return data
+    return data
 
     # ----------------------------
     # helper: run ATI attempts (your current logic) for given cities
