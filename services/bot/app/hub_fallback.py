@@ -1,3 +1,6 @@
+from typing import Optional
+
+
 async def hub_tail_fallback_to(
     *,
     from_city: str,  # A
