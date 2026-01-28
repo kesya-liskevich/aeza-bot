@@ -1,6 +1,18 @@
-from .geo import distance_km
-from .ati import _normalize_city_for_ati  # или откуда у тебя эта функция
+from typing import List
+from app.geo import distance_km
 
+
+def _norm_city(s: str) -> str:
+    """
+    Простая нормализация города:
+    - lowercase
+    - trim
+    - ё → е
+    """
+    return (s or "").strip().lower().replace("ё", "е")
+
+
+# Список логистических хабов (нормализованные названия)
 HUB_WHITELIST = [
     "москва",
     "санкт-петербург",
@@ -22,20 +34,29 @@ HUB_WHITELIST = [
     "владивосток",
 ]
 
+
 def is_hub(city: str) -> bool:
-    return _normalize_city_for_ati(city) in HUB_WHITELIST
+    """
+    Проверяет, является ли город логистическим хабом
+    """
+    return _norm_city(city) in HUB_WHITELIST
 
 
-async def nearest_hubs(city: str, top_k: int = 3) -> list[str]:
-    city = _normalize_city_for_ati(city)
-    scored = []
+async def nearest_hubs(city: str, top_k: int = 3) -> List[str]:
+    """
+    Возвращает top_k ближайших хабов к городу
+    (по расстоянию, через distance_km)
+    """
+    city_norm = _norm_city(city)
+    scored: list[tuple[float, str]] = []
 
     for hub in HUB_WHITELIST:
-        if hub == city:
+        if hub == city_norm:
             continue
-        km = await distance_km(city, hub)
-        if km:
+
+        km = await distance_km(city_norm, hub)
+        if km and km > 0:
             scored.append((km, hub))
 
     scored.sort(key=lambda x: x[0])
-    return [h for _, h in scored[:top_k]]
+    return [hub for _, hub in scored[:top_k]]
