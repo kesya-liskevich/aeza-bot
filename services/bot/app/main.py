@@ -2599,28 +2599,19 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
         d.with_nds = [True, False]
 
     # =====================================================================
-    # 7) ATI PIPELINE
+    # 7) ATI PIPELINE (+ HUB fallback)
     # =====================================================================
     log.warning("DEBUG GPT → ATI Draft: %s", d)
     log.warning("CAR TYPES FOR ATI: %s", d.car_types)
 
     ati_result = await ati_full_pipeline_simple(d)
     approx_rate_for_crm: Optional[int] = None
+    calc_method = "unknown"  # для менеджеров/логов
 
-    if not ati_result or not ati_result.get("rates"):
-        # --- Fallback ---
-        fallback_rate = await simple_rate_fallback(d)
-        approx_rate_for_crm = fallback_rate
-
-        client_text = render_simple_calc_application(
-            d,
-            fallback_rate,
-            user_name=cq.from_user.full_name,
-            user_id=cq.from_user.id,
-        )
-
-    else:
+    if ati_result and ati_result.get("rates"):
+        # --- ATI OK ---
         rates = ati_result["rates"]
+        calc_method = "ati"
 
         # минимальная ставка для CRM
         numeric_rates = [
@@ -2629,7 +2620,7 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
             if isinstance(r, dict) and isinstance(r.get("rate_from"), (int, float))
         ]
         if numeric_rates:
-            approx_rate_for_crm = min(numeric_rates)
+            approx_rate_for_crm = int(min(numeric_rates))
 
         # шаблон без ставки
         header_text = render_simple_calc_application(
@@ -2647,12 +2638,59 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
 
         client_text = header_text + "\n\n" + rates_text
 
+    else:
+        # --- ATI EMPTY → пробуем HUB ---
+        log.warning("ATI EMPTY → trying HUB fallback: %r -> %r", d.route_from, d.route_to)
+
+        hub_res = await hub_tail_fallback_to(
+            from_city=d.route_from or "",
+            to_city=d.route_to or "",
+            tonnage=getattr(d, "tonnage", None) or 20,
+            car_types=getattr(d, "car_types", None) or ["tent", "close"],
+        )
+
+        if hub_res:
+            calc_method = "hub"
+
+            # Для CRM сохраним минимальную оценку (from)
+            approx_rate_for_crm = int(hub_res["synthetic_rate_from"])
+
+            # Клиентский текст (коротко и честно)
+            client_text = (
+                render_simple_calc_application(
+                    d,
+                    rate_rub=None,
+                    user_name=cq.from_user.full_name,
+                    user_id=cq.from_user.id,
+                )
+                + "\n\n"
+                + "Нашли ориентир по рынку через ближайший логистический хаб.\n\n"
+                + f"Маршрут-основа: *{hub_res['base_route']}*\n"
+                + f"Хвост: *{hub_res['hub']} → {hub_res['to_city']}* ≈ {hub_res['distance_tail_km']:.0f} км\n\n"
+                + f"Ориентир ставки: *{hub_res['synthetic_rate_from']} – {hub_res['synthetic_rate_to']} ₽*\n"
+                + "_(по точному направлению нет статистики ATI, поэтому восстановили через хаб)_"
+            )
+
+        else:
+            # --- HUB тоже не помог → fallback как было ---
+            calc_method = "gpt_fallback"
+            fallback_rate = await simple_rate_fallback(d)
+            approx_rate_for_crm = fallback_rate
+
+            client_text = render_simple_calc_application(
+                d,
+                fallback_rate,
+                user_name=cq.from_user.full_name,
+                user_id=cq.from_user.id,
+            )
+
     # =====================================================================
     # 8) Сохраняем avg_rate
     # =====================================================================
     if approx_rate_for_crm is not None:
         d.avg_rate = approx_rate_for_crm
         await state.update_data(draft=asdict(d))
+
 
     # --- 9) Удаляем «минутку» ---
     try:
