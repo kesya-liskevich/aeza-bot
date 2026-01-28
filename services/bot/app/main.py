@@ -38,6 +38,8 @@ from datetime import date, timedelta
 
 from aiogram.types import FSInputFile
 
+from hub_fallback import hub_tail_fallback_to
+
 
 # Глобальный кэш городов ATI
 ATI_CITY_CACHE = []
@@ -1037,6 +1039,10 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     d = QuoteDraft(**data["draft"])
 
+    txt: str
+    rate_for_state = None
+    calc_status = "unknown"
+
     # ==============================
     # 1) Пробуем полный ATI pipeline
     # ==============================
@@ -1050,21 +1056,46 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
             user=cq.from_user,
         )
         rate_for_state = None
+        calc_status = "ati"
+
     else:
         # ==============================
-        # 2) Фолбэк: одна цифра
+        # 2) HUB fallback (A→C + хвост C→B)
         # ==============================
-        rate = await gpt_estimate_rate(d)
-        if rate is None:
-            rate = 50000
-
-        txt = render_simple_calc_application(
-            d,
-            rate,
-            user_name=cq.from_user.full_name,
-            user_id=cq.from_user.id,
+        hub_res = await hub_tail_fallback_to(
+            from_city=d.route_from or "",
+            to_city=d.route_to or "",
+            tonnage=getattr(d, "tonnage", None) or 20,
+            car_types=getattr(d, "car_types", None) or ["tent", "close"],
         )
-        rate_for_state = rate
+
+        if hub_res:
+            txt = (
+                "Нашли ориентир по рынку через ближайший логистический хаб.\n\n"
+                f"Маршрут-основа: *{hub_res['base_route']}*\n"
+                f"Хвост: *{hub_res['hub']} → {hub_res['to_city']}* ≈ {hub_res['distance_tail_km']:.0f} км\n\n"
+                f"Ориентир ставки: *{hub_res['synthetic_rate_from']} – {hub_res['synthetic_rate_to']} ₽*\n"
+                "_(по точному направлению нет статистики ATI, поэтому восстановили через хаб)_"
+            )
+            rate_for_state = None
+            calc_status = "hub"
+
+        else:
+            # ==============================
+            # 3) Фолбэк: одна цифра (как было)
+            # ==============================
+            rate = await gpt_estimate_rate(d)
+            if rate is None:
+                rate = 50000
+
+            txt = render_simple_calc_application(
+                d,
+                rate,
+                user_name=cq.from_user.full_name,
+                user_id=cq.from_user.id,
+            )
+            rate_for_state = rate
+            calc_status = "gpt"
 
     # удаляем сообщение «считаем»
     try:
@@ -1079,7 +1110,7 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
     await clean_tmp(cq.from_user.id)
 
     # ==============================
-    # 3) Клиенту
+    # 4) Клиенту
     # ==============================
     await bot.send_message(
         cq.from_user.id,
@@ -1088,7 +1119,7 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
     )
 
     # ==============================
-    # 4) Менеджерам — ТО ЖЕ САМОЕ
+    # 5) Менеджерам — ТО ЖЕ САМОЕ + статус
     # ==============================
     inbox_tid = await _get_inbox_thread_id()
     kb_inbox = InlineKeyboardMarkup(
@@ -1102,7 +1133,13 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
         ]
     )
 
-    card = txt + "\n\nСтатус: был только просчёт"
+    status_map = {
+        "ati": "ATI (есть статистика)",
+        "hub": "HUB (восстановлено через хаб)",
+        "gpt": "GPT (оценка одной цифрой)",
+        "unknown": "UNKNOWN",
+    }
+    card = txt + f"\n\nСтатус: был только просчёт\nМетод: {status_map.get(calc_status, calc_status)}"
 
     try:
         await bot.send_message(
