@@ -38,7 +38,8 @@ from datetime import date, timedelta
 
 from aiogram.types import FSInputFile
 
-from hub_fallback import hub_tail_fallback_to
+from app.hub_fallback import hub_tail_fallback_to
+
 
 
 # Глобальный кэш городов ATI
