@@ -2616,18 +2616,18 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
         client_text = header_text + "\n\n" + rates_text
 
     else:
-    # --- ATI EMPTY → простой fallback (HUB отключён для прода) ---
-    calc_method = "gpt_fallback"
+     # --- ATI EMPTY → простой fallback (HUB отключён для прода) ---
+     calc_method = "gpt_fallback"
 
-    fallback_rate = await simple_rate_fallback(d)
-    approx_rate_for_crm = fallback_rate
+     fallback_rate = await simple_rate_fallback(d)
+     approx_rate_for_crm = fallback_rate
 
-    client_text = render_simple_calc_application(
+     client_text = render_simple_calc_application(
         d,
         fallback_rate,
         user_name=cq.from_user.full_name,
         user_id=cq.from_user.id,
-    )
+     )
 
 
     # =====================================================================
