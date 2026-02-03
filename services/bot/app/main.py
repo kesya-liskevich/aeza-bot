@@ -1061,18 +1061,18 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
     # ==============================
     # 2) Фолбэк: одна цифра (HUB отключён)
     # ==============================
-    rate = await gpt_estimate_rate(d)
-    if rate is None:
+     rate = await gpt_estimate_rate(d)
+     if rate is None:
         rate = 50000
 
-    txt = render_simple_calc_application(
+     txt = render_simple_calc_application(
         d,
         rate,
         user_name=cq.from_user.full_name,
         user_id=cq.from_user.id,
-    )
-    rate_for_state = rate
-    calc_status = "gpt"
+     )
+     rate_for_state = rate
+     calc_status = "gpt"
 
 
     # удаляем сообщение «считаем»
