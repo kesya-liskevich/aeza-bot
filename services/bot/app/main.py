@@ -38,7 +38,6 @@ from datetime import date, timedelta
 
 from aiogram.types import FSInputFile
 
-from app.hub_fallback import hub_tail_fallback_to
 
 
 
@@ -1058,45 +1057,23 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
         )
         rate_for_state = None
         calc_status = "ati"
-
     else:
-        # ==============================
-        # 2) HUB fallback (A→C + хвост C→B)
-        # ==============================
-        hub_res = await hub_tail_fallback_to(
-            from_city=d.route_from or "",
-            to_city=d.route_to or "",
-            tonnage=getattr(d, "tonnage", None) or 20,
-            car_types=getattr(d, "car_types", None) or ["tent", "close"],
-        )
+    # ==============================
+    # 2) Фолбэк: одна цифра (HUB отключён)
+    # ==============================
+    rate = await gpt_estimate_rate(d)
+    if rate is None:
+        rate = 50000
 
-        if hub_res:
-            txt = (
-                "Нашли ориентир по рынку через ближайший логистический хаб.\n\n"
-                f"Маршрут-основа: *{hub_res['base_route']}*\n"
-                f"Хвост: *{hub_res['hub']} → {hub_res['to_city']}* ≈ {hub_res['distance_tail_km']:.0f} км\n\n"
-                f"Ориентир ставки: *{hub_res['synthetic_rate_from']} – {hub_res['synthetic_rate_to']} ₽*\n"
-                "_(по точному направлению нет статистики ATI, поэтому восстановили через хаб)_"
-            )
-            rate_for_state = None
-            calc_status = "hub"
+    txt = render_simple_calc_application(
+        d,
+        rate,
+        user_name=cq.from_user.full_name,
+        user_id=cq.from_user.id,
+    )
+    rate_for_state = rate
+    calc_status = "gpt"
 
-        else:
-            # ==============================
-            # 3) Фолбэк: одна цифра (как было)
-            # ==============================
-            rate = await gpt_estimate_rate(d)
-            if rate is None:
-                rate = 50000
-
-            txt = render_simple_calc_application(
-                d,
-                rate,
-                user_name=cq.from_user.full_name,
-                user_id=cq.from_user.id,
-            )
-            rate_for_state = rate
-            calc_status = "gpt"
 
     # удаляем сообщение «считаем»
     try:
@@ -2639,50 +2616,19 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
         client_text = header_text + "\n\n" + rates_text
 
     else:
-        # --- ATI EMPTY → пробуем HUB ---
-        log.warning("ATI EMPTY → trying HUB fallback: %r -> %r", d.route_from, d.route_to)
+    # --- ATI EMPTY → простой fallback (HUB отключён для прода) ---
+    calc_method = "gpt_fallback"
 
-        hub_res = await hub_tail_fallback_to(
-            from_city=d.route_from or "",
-            to_city=d.route_to or "",
-            tonnage=getattr(d, "tonnage", None) or 20,
-            car_types=getattr(d, "car_types", None) or ["tent", "close"],
-        )
+    fallback_rate = await simple_rate_fallback(d)
+    approx_rate_for_crm = fallback_rate
 
-        if hub_res:
-            calc_method = "hub"
+    client_text = render_simple_calc_application(
+        d,
+        fallback_rate,
+        user_name=cq.from_user.full_name,
+        user_id=cq.from_user.id,
+    )
 
-            # Для CRM сохраним минимальную оценку (from)
-            approx_rate_for_crm = int(hub_res["synthetic_rate_from"])
-
-            # Клиентский текст (коротко и честно)
-            client_text = (
-                render_simple_calc_application(
-                    d,
-                    rate_rub=None,
-                    user_name=cq.from_user.full_name,
-                    user_id=cq.from_user.id,
-                )
-                + "\n\n"
-                + "Нашли ориентир по рынку через ближайший логистический хаб.\n\n"
-                + f"Маршрут-основа: *{hub_res['base_route']}*\n"
-                + f"Хвост: *{hub_res['hub']} → {hub_res['to_city']}* ≈ {hub_res['distance_tail_km']:.0f} км\n\n"
-                + f"Ориентир ставки: *{hub_res['synthetic_rate_from']} – {hub_res['synthetic_rate_to']} ₽*\n"
-                + "_(по точному направлению нет статистики ATI, поэтому восстановили через хаб)_"
-            )
-
-        else:
-            # --- HUB тоже не помог → fallback как было ---
-            calc_method = "gpt_fallback"
-            fallback_rate = await simple_rate_fallback(d)
-            approx_rate_for_crm = fallback_rate
-
-            client_text = render_simple_calc_application(
-                d,
-                fallback_rate,
-                user_name=cq.from_user.full_name,
-                user_id=cq.from_user.id,
-            )
 
     # =====================================================================
     # 8) Сохраняем avg_rate
