@@ -2728,12 +2728,13 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
     log.warning("DEBUG GPT → ATI Draft: %s", d)
     log.warning("CAR TYPES FOR ATI: %s", d.car_types)
 
-    ati_result = await ati_full_pipeline_simple(d)
+    estimate_result = await estimate_rate(d)
     approx_rate_for_crm: Optional[int] = None
     calc_method = "unknown"  # для менеджеров/логов
 
-    if ati_result and ati_result.get("rates"):
+    if estimate_result and estimate_result.get("kind") == "ati":
         # --- ATI OK ---
+        ati_result = estimate_result["ati_result"]
         rates = ati_result["rates"]
         calc_method = "ati"
 
@@ -2762,19 +2763,33 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
 
         client_text = header_text + "\n\n" + rates_text
 
+    elif estimate_result and estimate_result.get("kind") == "hub_fallback":
+        hub_result: HubFallbackResult = estimate_result["hub_result"]
+        calc_method = "hub_fallback"
+
+        fallback_rate = int(round(hub_result.synthetic_rate_rub))
+        approx_rate_for_crm = fallback_rate
+
+        client_text = render_simple_calc_application(
+            d,
+            fallback_rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+            synthetic_note=f"Расчёт через хаб {hub_result.hub_city} (synthetic).",
+        )
     else:
-     # --- ATI EMPTY → простой fallback (HUB отключён для прода) ---
-     calc_method = "gpt_fallback"
+        # --- ATI EMPTY → простой fallback ---
+        calc_method = "gpt_fallback"
 
-     fallback_rate = await simple_rate_fallback(d)
-     approx_rate_for_crm = fallback_rate
+        fallback_rate = await simple_rate_fallback(d)
+        approx_rate_for_crm = fallback_rate
 
-     client_text = render_simple_calc_application(
-        d,
-        fallback_rate,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-     )
+        client_text = render_simple_calc_application(
+            d,
+            fallback_rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+        )
 
 
     # =====================================================================
