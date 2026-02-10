@@ -593,18 +593,14 @@ def kb_rate_result():
 
 
 
+
 # ===================== Заглушка расчёта ставки (до ATI) =====================
 
 async def simple_rate_fallback(draft: QuoteDraft) -> int:
     """
-    ВРЕМЕННО: простая заглушка, пока не подключён ATI.
-
-    Здесь будет новый pipeline:
-    - GPT нормализует заявку (города, кузов, тоннаж)
-    - ATI возвращает рыночные ставки
-    - GPT красиво оформляет ответ
-
-    Сейчас просто возвращаем фиксированную цифру.
+    Резервная заглушка: вернуть базовую оценку,
+    если ATI и hub fallback не дали результата.
+    Нужна, чтобы клиент получил ответ и мог оставить контакт.
     """
     return 50000
 
@@ -1084,6 +1080,7 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
             user_name=cq.from_user.full_name,
             user_id=cq.from_user.id,
         )
+        txt += "\n\n⚠️ ATI и hub fallback не дали ставку; показана базовая заглушка."
         rate_for_state = rate
         calc_status = "fallback"
 
@@ -2778,7 +2775,7 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
             synthetic_note=f"Расчёт через хаб {hub_result.hub_city} (synthetic).",
         )
     else:
-        # --- ATI EMPTY → простой fallback ---
+        # --- ATI EMPTY + HUB EMPTY → базовая заглушка ---
         calc_method = "gpt_fallback"
 
         fallback_rate = await simple_rate_fallback(d)
@@ -2790,6 +2787,7 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
             user_name=cq.from_user.full_name,
             user_id=cq.from_user.id,
         )
+        client_text += "\n\n⚠️ ATI и hub fallback не дали ставку; показана базовая заглушка."
 
 
     # =====================================================================

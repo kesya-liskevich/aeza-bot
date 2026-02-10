@@ -52,6 +52,7 @@ async def hub_fallback_pipeline(
         return None
 
     candidates = await nearest_hubs(B, top_k=hubs_top_k)
+    logger.info("Hub fallback: candidates for B=%s -> %s", B, candidates)
     if not candidates:
         logger.info("Hub fallback: no hub candidates for %s", B)
         return None
@@ -77,36 +78,90 @@ async def hub_fallback_pipeline(
             logger.info("Hub fallback: distance A→C unavailable (%s→%s)", A, C)
             continue
 
-        for car_type in car_types:
-            for with_nds in with_nds_options:
-                base_rate = await fetch_average_price(
-                    from_city_id=A_id,
-                    to_city_id=C_id,
-                    car_type=car_type,
-                    tonnage=tonnage,
-                    with_nds=with_nds,
-                )
-                if base_rate is None:
-                    continue
+        requested_car_types = [c for c in car_types if c]
+        expanded_car_types = requested_car_types + [
+            c for c in ("tent", "close", "open", "ref") if c not in requested_car_types
+        ]
 
-                rub_per_km = base_rate / dist_ac
-                synthetic_rate = base_rate + rub_per_km * dist_cb
+        tonnage_variants = [float(tonnage)]
+        if float(tonnage) != 20.0:
+            tonnage_variants.append(20.0)
 
-                return HubFallbackResult(
-                    method="hub_fallback",
-                    from_city=A,
-                    to_city=B,
-                    hub_city=C,
-                    base_route=f"{A} → {C}",
-                    tonnage=tonnage,
-                    car_type=car_type,
-                    with_nds=with_nds,
-                    base_rate_rub=base_rate,
-                    base_distance_km=dist_ac,
-                    tail_distance_km=dist_cb,
-                    rub_per_km=rub_per_km,
-                    synthetic_rate_rub=synthetic_rate,
-                )
+        attempts = [
+            ("requested", tonnage_variants[0], requested_car_types),
+            ("cartype_fallback", tonnage_variants[0], expanded_car_types),
+        ]
+        if len(tonnage_variants) > 1:
+            attempts.append(("tonnage_to_20", tonnage_variants[1], expanded_car_types))
+
+        logger.info(
+            "Hub fallback: try hub C=%s for A=%s B=%s (attempt_packs=%s)",
+            C,
+            A,
+            B,
+            [a[0] for a in attempts],
+        )
+
+        for attempt_name, attempt_tonnage, attempt_car_types in attempts:
+            logger.info(
+                "Hub fallback: attempt %s on A→C=%s→%s tonnage=%s car_types=%s",
+                attempt_name,
+                A,
+                C,
+                attempt_tonnage,
+                attempt_car_types,
+            )
+            for car_type in attempt_car_types:
+                for with_nds in with_nds_options:
+                    base_rate = await fetch_average_price(
+                        from_city_id=A_id,
+                        to_city_id=C_id,
+                        car_type=car_type,
+                        tonnage=attempt_tonnage,
+                        with_nds=with_nds,
+                    )
+                    if base_rate is None:
+                        logger.info(
+                            "Hub fallback: no base ATI %s→%s (%s tonnage=%s car=%s nds=%s)",
+                            A,
+                            C,
+                            attempt_name,
+                            attempt_tonnage,
+                            car_type,
+                            with_nds,
+                        )
+                        continue
+
+                    rub_per_km = base_rate / dist_ac
+                    synthetic_rate = base_rate + rub_per_km * dist_cb
+
+                    logger.info(
+                        "Hub fallback: selected hub=%s for route %s→%s (%s tonnage=%s car=%s nds=%s base_rate=%s)",
+                        C,
+                        A,
+                        B,
+                        attempt_name,
+                        attempt_tonnage,
+                        car_type,
+                        with_nds,
+                        int(round(base_rate)),
+                    )
+
+                    return HubFallbackResult(
+                        method="hub_fallback",
+                        from_city=A,
+                        to_city=B,
+                        hub_city=C,
+                        base_route=f"{A} → {C}",
+                        tonnage=attempt_tonnage,
+                        car_type=car_type,
+                        with_nds=with_nds,
+                        base_rate_rub=base_rate,
+                        base_distance_km=dist_ac,
+                        tail_distance_km=dist_cb,
+                        rub_per_km=rub_per_km,
+                        synthetic_rate_rub=synthetic_rate,
+                    )
 
     logger.info("Hub fallback: no ATI base rates for %s→%s via hubs", A, B)
     return None
