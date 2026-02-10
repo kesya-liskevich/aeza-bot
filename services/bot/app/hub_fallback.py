@@ -81,6 +81,8 @@ async def hub_fallback_pipeline(
         logger.warning("Hub fallback: CityId not found for B=%s", B)
         return None
 
+    best_result: Optional[HubFallbackResult] = None
+
     for C in candidates:
         C_id = await resolve_city_id(C)
         if not C_id:
@@ -180,19 +182,7 @@ async def hub_fallback_pipeline(
                     rub_per_km = base_rate / base_distance
                     synthetic_rate = base_rate + rub_per_km * extra_distance
 
-                    logger.info(
-                        "Hub fallback: selected hub=%s for route %s→%s (%s tonnage=%s car=%s nds=%s base_rate=%s)",
-                        C,
-                        A,
-                        B,
-                        attempt_name,
-                        attempt_tonnage,
-                        car_type,
-                        with_nds,
-                        int(round(base_rate)),
-                    )
-
-                    return HubFallbackResult(
+                    candidate_result = HubFallbackResult(
                         method="hub_fallback",
                         from_city=A,
                         to_city=B,
@@ -207,6 +197,34 @@ async def hub_fallback_pipeline(
                         rub_per_km=rub_per_km,
                         synthetic_rate_rub=synthetic_rate,
                     )
+
+                    if (
+                        best_result is None
+                        or candidate_result.synthetic_rate_rub < best_result.synthetic_rate_rub
+                    ):
+                        best_result = candidate_result
+                        logger.info(
+                            "Hub fallback: best hub updated=%s for route %s→%s (%s tonnage=%s car=%s nds=%s synthetic=%s)",
+                            C,
+                            A,
+                            B,
+                            attempt_name,
+                            attempt_tonnage,
+                            car_type,
+                            with_nds,
+                            int(round(candidate_result.synthetic_rate_rub)),
+                        )
+
+    if best_result is not None:
+        logger.info(
+            "Hub fallback: selected cheapest hub=%s for route %s→%s synthetic=%s base_route=%s",
+            best_result.hub_city,
+            A,
+            B,
+            int(round(best_result.synthetic_rate_rub)),
+            best_result.base_route,
+        )
+        return best_result
 
     logger.info("Hub fallback: no ATI base rates for %s→%s via hubs", A, B)
     return None

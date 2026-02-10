@@ -196,6 +196,28 @@ def render_application(d: QuoteDraft, rate_rub: Optional[int], user_name: str = 
     rows.append("ℹ️ Это ориентировочная ставка. Для точного расчёта подключим логиста.")
     return "\n".join(rows)
 
+
+
+def _city_display(name: str) -> str:
+    city = (name or "").strip()
+    return city.title() if city else "—"
+
+
+def build_hub_synthetic_note(hub_result: HubFallbackResult) -> str:
+    tail_cost = max(0, int(round(hub_result.synthetic_rate_rub - hub_result.base_rate_rub)))
+    hub_city = _city_display(hub_result.hub_city)
+
+    base_route = (hub_result.base_route or "").strip().lower()
+    if base_route.startswith((hub_result.hub_city or "").strip().lower()):
+        tail_city = _city_display(hub_result.from_city)
+    else:
+        tail_city = _city_display(hub_result.to_city)
+
+    return (
+        f"Маршрут через {hub_city} (стоимость {hub_city} - {tail_city}), "
+        f"плюс стоимость до {tail_city} ({fmt_rub(tail_cost)})"
+    )
+
 def render_simple_calc_application(
     d: QuoteDraft,
     rate_rub: Optional[int],
@@ -1066,7 +1088,7 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
             rate,
             user_name=cq.from_user.full_name,
             user_id=cq.from_user.id,
-            synthetic_note=f"Расчёт через хаб {hub_result.hub_city} (synthetic).",
+            synthetic_note=build_hub_synthetic_note(hub_result),
         )
         rate_for_state = rate
         calc_status = "hub_fallback"
@@ -2772,7 +2794,7 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
             fallback_rate,
             user_name=cq.from_user.full_name,
             user_id=cq.from_user.id,
-            synthetic_note=f"Расчёт через хаб {hub_result.hub_city} (synthetic).",
+            synthetic_note=build_hub_synthetic_note(hub_result),
         )
     else:
         # --- ATI EMPTY + HUB EMPTY → базовая заглушка ---
