@@ -203,19 +203,44 @@ def _city_display(name: str) -> str:
     return city.title() if city else "—"
 
 
+def _city_after_do(name: str) -> str:
+    city = _city_display(name)
+    low = city.lower()
+
+    if low.endswith("ск"):
+        return city + "а"
+    if low.endswith("бург"):
+        return city + "а"
+    if low.endswith("ь"):
+        return city[:-1] + "и"
+    if low.endswith("а"):
+        return city[:-1] + "ы"
+    if low.endswith("я"):
+        return city[:-1] + "и"
+    return city
+
+
 def build_hub_synthetic_note(hub_result: HubFallbackResult) -> str:
     tail_cost = max(0, int(round(hub_result.synthetic_rate_rub - hub_result.base_rate_rub)))
-    hub_city = _city_display(hub_result.hub_city)
 
-    base_route = (hub_result.base_route or "").strip().lower()
-    if base_route.startswith((hub_result.hub_city or "").strip().lower()):
+    base_from, base_to = "—", "—"
+    if "→" in (hub_result.base_route or ""):
+        left, right = hub_result.base_route.split("→", 1)
+        base_from, base_to = _city_display(left), _city_display(right)
+
+    base_rate = int(round(hub_result.base_rate_rub))
+
+    base_from_low = base_from.lower()
+    hub_low = (hub_result.hub_city or "").strip().lower()
+    if base_from_low.startswith(hub_low):
         tail_city = _city_display(hub_result.from_city)
     else:
         tail_city = _city_display(hub_result.to_city)
 
     return (
-        f"Маршрут через {hub_city} (стоимость {hub_city} - {tail_city}), "
-        f"плюс стоимость до {tail_city} ({fmt_rub(tail_cost)})"
+        f"Маршрут через {_city_display(hub_result.hub_city)} "
+        f"(стоимость {base_from} - {base_to}: {fmt_rub(base_rate)}), "
+        f"плюс стоимость до {_city_after_do(tail_city)} ({fmt_rub(tail_cost)})"
     )
 
 def render_simple_calc_application(
