@@ -38,6 +38,8 @@ from datetime import date, timedelta
 
 from aiogram.types import FSInputFile
 
+from app.geo import distance_km
+from app.hub_fallback import HubFallbackResult, hub_fallback_pipeline
 
 
 
@@ -199,6 +201,7 @@ def render_simple_calc_application(
     rate_rub: Optional[int],
     user_name: str = "",
     user_id: Optional[int] = None,
+    synthetic_note: Optional[str] = None,
 ) -> str:
     """
     Простой шаблон для новой линейки:
@@ -238,6 +241,8 @@ def render_simple_calc_application(
         rows.append("")
         rows.append("💰 Оценка ставки: от " + fmt_rub(rate_rub))
         rows.append("ℹ️ Это ориентировочная ставка. Для точного расчёта подключим логиста.")
+        if synthetic_note:
+            rows.append(f"⚠️ {synthetic_note}")
 
     return "\n".join(rows)
 
@@ -1044,12 +1049,12 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
     calc_status = "unknown"
 
     # ==============================
-    # 1) Пробуем полный ATI pipeline
+    # 1) ATI → hub fallback
     # ==============================
-    ati_result = await ati_full_pipeline_simple(d)
+    estimate_result = await estimate_rate(d)
 
-    if ati_result and ati_result.get("rates"):
-        # есть ставки по нескольким кузовам → красивый текст
+    if estimate_result and estimate_result.get("kind") == "ati":
+        ati_result = estimate_result["ati_result"]
         txt = await gpt_render_final_rate_simple(
             draft=d,
             rates=ati_result["rates"],
@@ -1057,22 +1062,30 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
         )
         rate_for_state = None
         calc_status = "ati"
+    elif estimate_result and estimate_result.get("kind") == "hub_fallback":
+        hub_result: HubFallbackResult = estimate_result["hub_result"]
+        rate = int(round(hub_result.synthetic_rate_rub))
+        txt = render_simple_calc_application(
+            d,
+            rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+            synthetic_note=f"Расчёт через хаб {hub_result.hub_city} (synthetic).",
+        )
+        rate_for_state = rate
+        calc_status = "hub_fallback"
     else:
-    # ==============================
-    # 2) Фолбэк: одна цифра (HUB отключён)
-    # ==============================
-     rate = await gpt_estimate_rate(d)
-     if rate is None:
-        rate = 50000
-
-     txt = render_simple_calc_application(
-        d,
-        rate,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-     )
-     rate_for_state = rate
-     calc_status = "gpt"
+        rate = await simple_rate_fallback(d)
+        if rate is None:
+            rate = 50000
+        txt = render_simple_calc_application(
+            d,
+            rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+        )
+        rate_for_state = rate
+        calc_status = "fallback"
 
 
     # удаляем сообщение «считаем»
@@ -1729,7 +1742,7 @@ def _ati_normalize_cartype(car_type: str) -> str:
 from datetime import date, timedelta
 from typing import Optional
 
-async def ati_fetch_rate_single(
+async def _ati_fetch_prices_in_rub(
     *,
     from_city_id: int,
     to_city_id: int,
@@ -1740,13 +1753,7 @@ async def ati_fetch_rate_single(
     round_trip: bool = False,
 ) -> Optional[dict]:
     """
-    СТРОГО как считает сайт ATI.
-
-    КЛЮЧЕВОЕ:
-    - Frequency = "day"
-    - DateFrom / DateTo
-    - Берём ТОЛЬКО PricesInRub.AveragePrice
-    - НИКАКИХ умножений
+    Возвращает PricesInRub из ATI average_prices без модификаций.
     """
 
     if not ATI_API_TOKEN:
@@ -1793,13 +1800,84 @@ async def ati_fetch_rate_single(
     if not isinstance(avg, (int, float)):
         return None
 
+    return prices
+
+
+async def ati_fetch_rate_single(
+    *,
+    from_city_id: int,
+    to_city_id: int,
+    car_type: str,
+    tonnage: float,
+    with_nds: bool,
+    days_back: int = 14,          # 👈 как на сайте
+    round_trip: bool = False,
+) -> Optional[dict]:
+    """
+    СТРОГО как считает сайт ATI.
+
+    КЛЮЧЕВОЕ:
+    - Frequency = "day"
+    - DateFrom / DateTo
+    - Берём ТОЛЬКО PricesInRub.AveragePrice
+    - НИКАКИХ умножений
+    """
+    prices = await _ati_fetch_prices_in_rub(
+        from_city_id=from_city_id,
+        to_city_id=to_city_id,
+        car_type=car_type,
+        tonnage=tonnage,
+        with_nds=with_nds,
+        days_back=days_back,
+        round_trip=round_trip,
+    )
+    if not prices:
+        return None
+
+    avg = prices.get("AveragePrice")
+    if not isinstance(avg, (int, float)):
+        return None
+
     return {
-        "car_type": car,
+        "car_type": _ati_normalize_cartype(car_type),
         "with_nds": with_nds,
-        "tonnage": tonnage_value,
+        "tonnage": normalize_ati_tonnage(tonnage),
         "rate_from": int(round(avg)),
         "rate_to": int(round(prices.get("UpperPrice", avg))),
     }
+
+
+async def ati_fetch_average_price_raw(
+    *,
+    from_city_id: int,
+    to_city_id: int,
+    car_type: str,
+    tonnage: float,
+    with_nds: bool,
+    days_back: int = 14,
+    round_trip: bool = False,
+) -> Optional[float]:
+    """
+    Возвращает PricesInRub.AveragePrice как есть (без модификаций).
+    Используется для hub fallback, чтобы не загрязнять основной ATI pipeline.
+    """
+    prices = await _ati_fetch_prices_in_rub(
+        from_city_id=from_city_id,
+        to_city_id=to_city_id,
+        car_type=car_type,
+        tonnage=tonnage,
+        with_nds=with_nds,
+        days_back=days_back,
+        round_trip=round_trip,
+    )
+    if not prices:
+        return None
+
+    avg = prices.get("AveragePrice")
+    if not isinstance(avg, (int, float)):
+        return None
+
+    return float(avg)
 
 
 async def ati_collect_full_rates(
@@ -1853,7 +1931,6 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
       3) Нормализуем тоннаж в 1.5/3/5/10/20
       4) Берём доступные кузова для направления+тоннажа из v2/all_directions
       5) Делаем N запросов average_prices (по одному на кузов и НДС/без НДС)
-      6) Если ставок нет — просим GPT подобрать хабы и повторяем по хабам (быстро, с лимитом)
     """
     if not oai_client or not ATI_API_TOKEN:
         log.warning("ATI pipeline: нет OpenAI клиента или ATI токена")
@@ -2031,7 +2108,7 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
     # ----------------------------
     # First: try original route (fast)
     # ----------------------------
-    GLOBAL_BUDGET = 24  # общий лимит запросов average_prices за весь пайплайн (оригинал + хабы)
+    GLOBAL_BUDGET = 24  # общий лимит запросов average_prices за весь пайплайн
     result, GLOBAL_BUDGET, last_empty = await _run_attempts_for_route(
         from_city_name=from_city,
         to_city_name=to_city,
@@ -2042,6 +2119,76 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
     )
     if result:
         return result
+
+
+async def estimate_rate(draft: QuoteDraft) -> Optional[dict]:
+    """
+    Estimate rate:
+      1) ati_full_pipeline_simple(A→B)
+      2) if rates exist — return them
+      3) if no rates — hub_fallback_pipeline(draft)
+    """
+    log.info(
+        "ESTIMATE_RATE ENTER from=%s to=%s quote_id=%s",
+        draft.route_from,
+        draft.route_to,
+        getattr(draft, "quote_id", None),
+    )
+    ati_result = await ati_full_pipeline_simple(draft)
+    rates = ati_result.get("rates") if isinstance(ati_result, dict) else None
+    rates_count = len(rates) if isinstance(rates, list) else 0
+    log.info("ESTIMATE_RATE ATI rates_count=%s", rates_count)
+    if rates_count > 0:
+        return {"kind": "ati", "ati_result": ati_result}
+
+    log.info("ESTIMATE_RATE FALLBACK START reason=no_rates")
+
+    norm = await gpt_prepare_ati_request(draft)
+    if not norm:
+        log.warning("Hub fallback: GPT нормализация не удалась")
+        return None
+
+    from_city = (norm.get("from_city") or draft.route_from or "").strip()
+    to_city = (norm.get("to_city") or draft.route_to or "").strip()
+    if not from_city or not to_city:
+        log.warning("Hub fallback: нет городов (%r → %r)", from_city, to_city)
+        return None
+
+    raw_tonnage = norm.get("tonnage")
+    if raw_tonnage is None:
+        try:
+            if draft.truck_class:
+                raw_tonnage = float(str(draft.truck_class).replace(",", "."))
+        except Exception:
+            raw_tonnage = None
+
+    tonnage = normalize_ati_tonnage(raw_tonnage or 20)
+
+    raw_car_types = norm.get("car_types") or []
+    car_types = [_ati_normalize_cartype(x) for x in raw_car_types if x]
+    if not car_types:
+        car_types = ["tent", "close"]
+
+    hub_result = await hub_fallback_pipeline(
+        from_city=from_city,
+        to_city=to_city,
+        tonnage=tonnage,
+        car_types=car_types,
+        resolve_city_id=ati_resolve_city_id,
+        fetch_average_price=ati_fetch_average_price_raw,
+        distance_km=distance_km,
+        logger=log,
+    )
+    if hub_result:
+        log.warning(
+            "Hub fallback used: %s→%s via %s",
+            from_city,
+            to_city,
+            hub_result.hub_city,
+        )
+        return {"kind": "hub_fallback", "hub_result": hub_result}
+
+    return None
 
 
 async def estimate_rate_via_ati(draft: QuoteDraft) -> Optional[int]:
@@ -2581,12 +2728,13 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
     log.warning("DEBUG GPT → ATI Draft: %s", d)
     log.warning("CAR TYPES FOR ATI: %s", d.car_types)
 
-    ati_result = await ati_full_pipeline_simple(d)
+    estimate_result = await estimate_rate(d)
     approx_rate_for_crm: Optional[int] = None
     calc_method = "unknown"  # для менеджеров/логов
 
-    if ati_result and ati_result.get("rates"):
+    if estimate_result and estimate_result.get("kind") == "ati":
         # --- ATI OK ---
+        ati_result = estimate_result["ati_result"]
         rates = ati_result["rates"]
         calc_method = "ati"
 
@@ -2615,19 +2763,33 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
 
         client_text = header_text + "\n\n" + rates_text
 
+    elif estimate_result and estimate_result.get("kind") == "hub_fallback":
+        hub_result: HubFallbackResult = estimate_result["hub_result"]
+        calc_method = "hub_fallback"
+
+        fallback_rate = int(round(hub_result.synthetic_rate_rub))
+        approx_rate_for_crm = fallback_rate
+
+        client_text = render_simple_calc_application(
+            d,
+            fallback_rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+            synthetic_note=f"Расчёт через хаб {hub_result.hub_city} (synthetic).",
+        )
     else:
-     # --- ATI EMPTY → простой fallback (HUB отключён для прода) ---
-     calc_method = "gpt_fallback"
+        # --- ATI EMPTY → простой fallback ---
+        calc_method = "gpt_fallback"
 
-     fallback_rate = await simple_rate_fallback(d)
-     approx_rate_for_crm = fallback_rate
+        fallback_rate = await simple_rate_fallback(d)
+        approx_rate_for_crm = fallback_rate
 
-     client_text = render_simple_calc_application(
-        d,
-        fallback_rate,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-     )
+        client_text = render_simple_calc_application(
+            d,
+            fallback_rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+        )
 
 
     # =====================================================================
@@ -2826,4 +2988,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
