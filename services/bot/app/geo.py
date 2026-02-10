@@ -1,4 +1,19 @@
+import logging
+import os
 from typing import Optional
+
+import aiohttp
+from redis.asyncio import Redis
+
+
+log = logging.getLogger("bot")
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+NOMINATIM_BASE_URL = os.environ.get("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org")
+NOMINATIM_UA = os.environ.get("NOMINATIM_UA", "aeza-logistic-bot/1.0")
+OSRM_BASE_URL = os.environ.get("OSRM_BASE_URL", "https://router.project-osrm.org")
+
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
 
 # ===== GEO / DISTANCE (Redis cache) =====
 
