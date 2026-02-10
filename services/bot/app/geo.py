@@ -6,6 +6,34 @@ _GEO_TTL = 180 * 24 * 60 * 60                # 180 дней
 _DIST_TTL = 365 * 24 * 60 * 60               # 365 дней
 
 
+def _normalize_city_for_ati(name: str) -> str:
+    if not name:
+        return ""
+    n = name.strip().lower()
+
+    mapping = {
+        "спб": "санкт-петербург",
+        "питер": "санкт-петербург",
+        "санкт петербург": "санкт-петербург",
+        "st petersburg": "санкт-петербург",
+        "st. petersburg": "санкт-петербург",
+        "мск": "москва",
+        "г москва": "москва",
+        "г. москва": "москва",
+    }
+    if n in mapping:
+        return mapping[n]
+
+    if "," in n:
+        n = n.split(",", 1)[0].strip()
+
+    for junk in ("город ", "г. ", "г "):
+        if n.startswith(junk):
+            n = n[len(junk):]
+
+    return n
+
+
 def _norm_geo_city(name: str) -> str:
     # используем ту же нормализацию, что и для ATI (важно!)
     return _normalize_city_for_ati(name)
