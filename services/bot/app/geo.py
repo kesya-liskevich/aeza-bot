@@ -1,3 +1,5 @@
+from typing import Optional
+
 # ===== GEO / DISTANCE (Redis cache) =====
 
 GEO_KEY = "geo:city:{name}"                  # -> "lat,lon"
