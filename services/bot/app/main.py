@@ -343,6 +343,24 @@ def _history_line(kind: str, text: str) -> str:
     return f"[{stamp}] {kind}: {body}"
 
 
+def _build_calc_history_summary(d: QuoteDraft, method: str, rate_rub: Optional[int]) -> str:
+    quote = f"#{d.quote_id}" if getattr(d, "quote_id", None) else "без номера"
+    route = f"{(d.route_from or '—').strip()} → {(d.route_to or '—').strip()}"
+
+    method_map = {
+        "ati": "ATI",
+        "hub_fallback": "HUB",
+        "fallback": "заглушка",
+        "gpt_fallback": "заглушка",
+    }
+    method_label = method_map.get(method, method)
+
+    if rate_rub is None:
+        return f"Просчёт {quote}: {route}; метод={method_label}; ставка: несколько вариантов"
+
+    return f"Просчёт {quote}: {route}; метод={method_label}; ставка: от {fmt_rub(rate_rub)}"
+
+
 async def save_client_history(user_id: int, kind: str, text: str) -> None:
     try:
         key = CLIENT_HISTORY.format(uid=user_id)
@@ -1186,7 +1204,11 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
         txt,
         reply_markup=kb_rate_result(),
     )
-    await save_client_history(cq.from_user.id, "просчёт", txt)
+    await save_client_history(
+        cq.from_user.id,
+        "просчёт",
+        _build_calc_history_summary(d, calc_status, rate_for_state),
+    )
 
     # ==============================
     # 5) Менеджерам — ТО ЖЕ САМОЕ + статус
@@ -2892,7 +2914,11 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
         client_text,
         reply_markup=kb_rate_result(),
     )
-    await save_client_history(cq.from_user.id, "просчёт", client_text)
+    await save_client_history(
+        cq.from_user.id,
+        "просчёт",
+        _build_calc_history_summary(d, calc_method, approx_rate_for_crm),
+    )
 
     # 📸 10.1) Финальная картинка
     await send_tmp_photo(
