@@ -86,6 +86,7 @@ USER_TMP_STACK = "tmpmsgs:{uid}"  # список message_id, чтобы чист
 # --- Redis key templates ---
 THREAD_TO_CLIENT = "thread_to_client:{tid}"
 CLIENT_TO_THREAD = "client_to_thread:{uid}"
+CLIENT_HISTORY = "client_history:{uid}"
 
 # ===================== Доменные модели =====================
 
@@ -332,6 +333,37 @@ async def send_tmp_by_id(chat_id: int, text: str, **kwargs) -> Message:
     key = USER_TMP_STACK.format(uid=chat_id)
     await redis.rpush(key, msg.message_id)
     return msg
+
+
+def _history_line(kind: str, text: str) -> str:
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    body = (text or "").replace("\n", " ").strip()
+    if len(body) > 380:
+        body = body[:377] + "..."
+    return f"[{stamp}] {kind}: {body}"
+
+
+async def save_client_history(user_id: int, kind: str, text: str) -> None:
+    try:
+        key = CLIENT_HISTORY.format(uid=user_id)
+        await redis.rpush(key, _history_line(kind, text))
+        await redis.ltrim(key, -25, -1)
+    except Exception as e:
+        log.warning("save_client_history failed for %s: %s", user_id, e)
+
+
+async def build_client_history_text(user_id: int, limit: int = 10) -> Optional[str]:
+    try:
+        key = CLIENT_HISTORY.format(uid=user_id)
+        items = await redis.lrange(key, -limit, -1)
+    except Exception as e:
+        log.warning("build_client_history_text failed for %s: %s", user_id, e)
+        return None
+
+    if not items:
+        return None
+
+    return "📚 История по клиенту:\n" + "\n".join(f"• {x}" for x in items)
 
 from aiogram.types import FSInputFile, Message
 
@@ -684,6 +716,7 @@ async def mode_ask(cq: CallbackQuery, state: FSMContext):
 
 @router.message(Flow.JUST_ASK_INPUT, F.text.len() > 0)
 async def just_ask_input(m: Message, state: FSMContext):
+    await save_client_history(m.from_user.id, "вопрос", m.text)
     # 1) отправляем запрос во внутренний API (как раньше)
     payload = {
         "tg_id": str(m.from_user.id),
@@ -757,6 +790,7 @@ async def mode_call(cq: CallbackQuery, state: FSMContext):
 @router.message(CallFlow.CALLBACK_PHONE, F.text.len() > 0)
 async def callback_phone(m: Message, state: FSMContext):
     phone = m.text.strip()
+    await save_client_history(m.from_user.id, "звонок", f"Запросил звонок: {phone}")
 
     # 1) Шлём тикет во внутренний API
     payload = {
@@ -1152,6 +1186,7 @@ async def review_confirm(cq: CallbackQuery, state: FSMContext):
         txt,
         reply_markup=kb_rate_result(),
     )
+    await save_client_history(cq.from_user.id, "просчёт", txt)
 
     # ==============================
     # 5) Менеджерам — ТО ЖЕ САМОЕ + статус
@@ -2857,6 +2892,7 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
         client_text,
         reply_markup=kb_rate_result(),
     )
+    await save_client_history(cq.from_user.id, "просчёт", client_text)
 
     # 📸 10.1) Финальная картинка
     await send_tmp_photo(
@@ -2953,14 +2989,32 @@ async def cb_take(cq: CallbackQuery):
         except Exception:
             pass
 
+        intro_text = (
+            "Диалог по заявке открыт. Пишите в этой теме — клиент будет получать сообщения.\n"
+            "Для завершения напишите /close"
+        )
         await bot.send_message(
             chat_id=MANAGER_GROUP_ID,
             message_thread_id=topic_id,
-            text=(
-                "Диалог по заявке открыт. Пишите в этой теме — клиент будет получать сообщения.\n"
-                "Для завершения напишите /close"
-            ),
+            text=intro_text,
         )
+
+        # Текущий просчёт/вопрос из карточки + история клиента
+        card_text = (cq.message.text or "").strip()
+        if card_text:
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=topic_id,
+                text="🧾 Актуальная карточка:\n" + card_text,
+            )
+
+        history_text = await build_client_history_text(client_id, limit=10)
+        if history_text:
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=topic_id,
+                text=history_text,
+            )
         await cq.answer("Тикет назначен вам")
     except TelegramBadRequest as e:
         # Частый кейс: темы выключены в группе
