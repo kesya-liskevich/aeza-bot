@@ -1127,133 +1127,17 @@ async def review_edit(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "review:confirm", Flow.REVIEW)
 async def review_confirm(cq: CallbackQuery, state: FSMContext):
-
-    await state.set_state(Flow.RATE)
-
-    # временное сообщение «считаем»
-    calc_msg = await send_tmp_by_id(
-        cq.from_user.id,
-        "Считаем ставку по вашей заявке…"
-    )
-
+    """
+    Legacy-путь подтверждения. Делегируем в единый сценарий calc_confirm,
+    чтобы не дублировать расчёт/fallback/историю/карточку менеджерам в двух местах.
+    """
     data = await state.get_data()
-    d = QuoteDraft(**data["draft"])
+    if "draft" not in data:
+        await cq.answer("Не удалось найти заявку, попробуйте заново", show_alert=True)
+        return
 
-    txt: str
-    rate_for_state = None
-    calc_status = "unknown"
-
-    # ==============================
-    # 1) ATI → hub fallback
-    # ==============================
-    estimate_result = await estimate_rate(d)
-
-    if estimate_result and estimate_result.get("kind") == "ati":
-        ati_result = estimate_result["ati_result"]
-        txt = await gpt_render_final_rate_simple(
-            draft=d,
-            rates=ati_result["rates"],
-            user=cq.from_user,
-        )
-        rate_for_state = None
-        calc_status = "ati"
-    elif estimate_result and estimate_result.get("kind") == "hub_fallback":
-        hub_result: HubFallbackResult = estimate_result["hub_result"]
-        rate = int(round(hub_result.synthetic_rate_rub))
-        txt = render_simple_calc_application(
-            d,
-            rate,
-            user_name=cq.from_user.full_name,
-            user_id=cq.from_user.id,
-            synthetic_note=build_hub_synthetic_note(hub_result),
-        )
-        rate_for_state = rate
-        calc_status = "hub_fallback"
-    else:
-        rate = await simple_rate_fallback(d)
-        if rate is None:
-            rate = 50000
-        txt = render_simple_calc_application(
-            d,
-            rate,
-            user_name=cq.from_user.full_name,
-            user_id=cq.from_user.id,
-        )
-        txt += "\n\n⚠️ ATI и hub fallback не дали ставку; показана базовая заглушка."
-        rate_for_state = rate
-        calc_status = "fallback"
-
-
-    # удаляем сообщение «считаем»
-    try:
-        await bot.delete_message(
-            chat_id=cq.from_user.id,
-            message_id=calc_msg.message_id
-        )
-    except Exception:
-        pass
-
-    # чистим временные сообщения
-    await clean_tmp(cq.from_user.id)
-
-    # ==============================
-    # 4) Клиенту
-    # ==============================
-    await bot.send_message(
-        cq.from_user.id,
-        txt,
-        reply_markup=kb_rate_result(),
-    )
-    await save_client_history(
-        cq.from_user.id,
-        "просчёт",
-        _build_calc_history_summary(d, calc_status, rate_for_state),
-    )
-
-    # ==============================
-    # 5) Менеджерам — ТО ЖЕ САМОЕ + статус
-    # ==============================
-    inbox_tid = await _get_inbox_thread_id()
-    kb_inbox = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Взять клиента",
-                    callback_data=f"take:calc:{cq.from_user.id}"
-                )
-            ]
-        ]
-    )
-
-    status_map = {
-        "ati": "ATI (есть статистика)",
-        "hub": "HUB (восстановлено через хаб)",
-        "gpt": "GPT (оценка одной цифрой)",
-        "unknown": "UNKNOWN",
-    }
-    card = txt + f"\n\nСтатус: был только просчёт\nМетод: {status_map.get(calc_status, calc_status)}"
-
-    try:
-        await bot.send_message(
-            chat_id=MANAGER_GROUP_ID,
-            text=card,
-            reply_markup=kb_inbox,
-            message_thread_id=inbox_tid,
-        )
-    except TelegramMigrateToChat as e:
-        await bot.send_message(
-            chat_id=e.migrate_to_chat_id,
-            text=card,
-            reply_markup=kb_inbox,
-            message_thread_id=inbox_tid,
-        )
-
-    # сохраняем avg_rate ТОЛЬКО если была одна цифра
-    if rate_for_state is not None:
-        d.avg_rate = rate_for_state
-        await state.update_data(draft=asdict(d))
-
-    await cq.answer()
+    await state.set_state(CalcFlow.REVIEW)
+    await calc_confirm(cq, state)
 
 
 from openai import AsyncOpenAI
@@ -3058,6 +2942,9 @@ async def cb_take(cq: CallbackQuery):
 async def relay_from_manager(m: Message):
     if m.chat.id != MANAGER_GROUP_ID:
         return
+    # сообщения самого бота не релеим обратно клиенту
+    if m.from_user and m.from_user.id == (await bot.get_me()).id:
+        return
     # нужно отвечать в теме (thread)
     tid = getattr(m, "message_thread_id", None)
     if not tid:
@@ -3069,14 +2956,96 @@ async def relay_from_manager(m: Message):
         client_id = int(client_id_str)
         # Текст/медиа
         if m.text:
-            await bot.send_message(client_id, m.text, parse_mode="HTML")
+            await bot.send_message(client_id, m.text)
         elif m.photo:
-            await bot.send_photo(client_id, m.photo[-1].file_id, caption=m.caption or "", parse_mode="HTML")
+            await bot.send_photo(client_id, m.photo[-1].file_id, caption=m.caption or "")
         elif m.document:
-            await bot.send_document(client_id, m.document.file_id, caption=m.caption or "", parse_mode="HTML")
+            await bot.send_document(client_id, m.document.file_id, caption=m.caption or "")
+        elif m.voice:
+            await bot.send_voice(client_id, m.voice.file_id, caption=m.caption or "")
+        elif m.audio:
+            await bot.send_audio(client_id, m.audio.file_id, caption=m.caption or "")
+        elif m.video:
+            await bot.send_video(client_id, m.video.file_id, caption=m.caption or "")
+        else:
+            log.info("relay: unsupported message type in tid=%s from=%s", tid, m.from_user.id if m.from_user else None)
+            return
+
+        log.info("relay: delivered manager message tid=%s -> client=%s", tid, client_id)
         # (Если нужно — добавить пересылку фото/доков: get_file → download → send_document)
     except Exception as e:
         log.warning("Не удалось переслать клиенту из темы %s: %s", tid, e)
+
+
+@router.message(F.chat.type == "private")
+async def relay_from_client(m: Message):
+    """
+    Если клиент уже привязан к менеджерскому тикету (topic),
+    дублируем его новые сообщения в соответствующую тему менеджеров.
+    """
+    # системные команды и служебные апдейты тут не трогаем
+    if m.text and m.text.startswith("/"):
+        return
+
+    uid = m.from_user.id if m.from_user else None
+    if not uid:
+        return
+
+    try:
+        tid_str = await redis.get(CLIENT_TO_THREAD.format(uid=uid))
+        if not tid_str:
+            return
+        tid = int(tid_str)
+
+        prefix = f"💬 Клиент {m.from_user.full_name if m.from_user else uid} • TG ID {uid}"
+
+        if m.text:
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                text=f"{prefix}\n\n{m.text}",
+            )
+        elif m.photo:
+            await bot.send_photo(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                photo=m.photo[-1].file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        elif m.document:
+            await bot.send_document(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                document=m.document.file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        elif m.voice:
+            await bot.send_voice(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                voice=m.voice.file_id,
+                caption=prefix,
+            )
+        elif m.audio:
+            await bot.send_audio(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                audio=m.audio.file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        elif m.video:
+            await bot.send_video(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                video=m.video.file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        else:
+            return
+
+        log.info("relay: delivered client message uid=%s -> tid=%s", uid, tid)
+    except Exception as e:
+        log.warning("Не удалось переслать сообщение клиента %s в тему менеджера: %s", uid, e)
 
 # ===================== Запуск =====================
 
