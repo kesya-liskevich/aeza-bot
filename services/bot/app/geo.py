@@ -1,9 +1,54 @@
+import logging
+import os
+from typing import Optional
+
+import aiohttp
+from redis.asyncio import Redis
+
+
+log = logging.getLogger("bot")
+
+REDIS_URL = os.environ.get("REDIS_URL", "redis://redis:6379/0")
+NOMINATIM_BASE_URL = os.environ.get("NOMINATIM_BASE_URL", "https://nominatim.openstreetmap.org")
+NOMINATIM_UA = os.environ.get("NOMINATIM_UA", "aeza-logistic-bot/1.0")
+OSRM_BASE_URL = os.environ.get("OSRM_BASE_URL", "https://router.project-osrm.org")
+
+redis = Redis.from_url(REDIS_URL, decode_responses=True)
+
 # ===== GEO / DISTANCE (Redis cache) =====
 
 GEO_KEY = "geo:city:{name}"                  # -> "lat,lon"
 DIST_KEY = "dist:km:{a}::{b}"                # -> float str
 _GEO_TTL = 180 * 24 * 60 * 60                # 180 дней
 _DIST_TTL = 365 * 24 * 60 * 60               # 365 дней
+
+
+def _normalize_city_for_ati(name: str) -> str:
+    if not name:
+        return ""
+    n = name.strip().lower()
+
+    mapping = {
+        "спб": "санкт-петербург",
+        "питер": "санкт-петербург",
+        "санкт петербург": "санкт-петербург",
+        "st petersburg": "санкт-петербург",
+        "st. petersburg": "санкт-петербург",
+        "мск": "москва",
+        "г москва": "москва",
+        "г. москва": "москва",
+    }
+    if n in mapping:
+        return mapping[n]
+
+    if "," in n:
+        n = n.split(",", 1)[0].strip()
+
+    for junk in ("город ", "г. ", "г "):
+        if n.startswith(junk):
+            n = n[len(junk):]
+
+    return n
 
 
 def _norm_geo_city(name: str) -> str:
