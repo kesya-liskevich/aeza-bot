@@ -31,6 +31,7 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
 )
 from redis.asyncio import Redis
+from redis.exceptions import ReadOnlyError
 
 from aiogram.client.default import DefaultBotProperties
 
@@ -316,22 +317,48 @@ _ATI_CITY_CACHE_LOADED = False
 async def _get_inbox_thread_id() -> Optional[int]:
     if TOPIC_INBOX:
         return TOPIC_INBOX
-    val = await redis.get(R_INBOX_TOPIC)
+    try:
+        val = await redis.get(R_INBOX_TOPIC)
+    except Exception as e:
+        log.warning("redis get inbox topic failed: %s", e)
+        return None
     try:
         return int(val) if val else None
     except Exception:
         return None
 
+
+def _is_readonly_redis_error(exc: Exception) -> bool:
+    if isinstance(exc, ReadOnlyError):
+        return True
+    return "read only replica" in str(exc).lower()
+
+
+def _log_redis_write_error(action: str, exc: Exception) -> None:
+    if _is_readonly_redis_error(exc):
+        log.error(
+            "Redis write skipped (%s): read-only replica. Check REDIS_URL and point bot to writable master.",
+            action,
+        )
+    else:
+        log.warning("Redis write failed (%s): %s", action, exc)
+
 async def send_tmp(m: Message, text: str, **kwargs) -> Message:
     msg = await m.answer(text, **kwargs)
     key = USER_TMP_STACK.format(uid=m.from_user.id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp:{key}", e)
     return msg
 
 async def send_tmp_by_id(chat_id: int, text: str, **kwargs) -> Message:
     msg = await bot.send_message(chat_id, text, **kwargs)
     key = USER_TMP_STACK.format(uid=chat_id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp_by_id:{key}", e)
     return msg
 
 
@@ -362,12 +389,12 @@ def _build_calc_history_summary(d: QuoteDraft, method: str, rate_rub: Optional[i
 
 
 async def save_client_history(user_id: int, kind: str, text: str) -> None:
+    key = CLIENT_HISTORY.format(uid=user_id)
     try:
-        key = CLIENT_HISTORY.format(uid=user_id)
         await redis.rpush(key, _history_line(kind, text))
         await redis.ltrim(key, -25, -1)
     except Exception as e:
-        log.warning("save_client_history failed for %s: %s", user_id, e)
+        _log_redis_write_error(f"save_client_history:{key}", e)
 
 
 async def build_client_history_text(user_id: int, limit: int = 10) -> Optional[str]:
@@ -395,7 +422,10 @@ async def send_tmp_photo(
     msg = await m.answer_photo(photo, caption=caption, **kwargs)
 
     key = USER_TMP_STACK.format(uid=m.from_user.id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp_photo:{key}", e)
 
     return msg
 
@@ -415,7 +445,10 @@ async def send_tmp_photo_by_user_id(
     )
 
     key = USER_TMP_STACK.format(uid=user_id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp_photo_by_user_id:{key}", e)
 
     return msg
 
@@ -469,7 +502,11 @@ async def ensure_quote_header(user_id: int, state: FSMContext) -> None:
 
 async def clean_tmp(user_id: int, keep_last: int = 0):
     key = USER_TMP_STACK.format(uid=user_id)
-    ids = await redis.lrange(key, 0, -1)
+    try:
+        ids = await redis.lrange(key, 0, -1)
+    except Exception as e:
+        log.warning("clean_tmp redis read failed for %s: %s", user_id, e)
+        return
     if not ids:
         return
     if keep_last > 0:
@@ -482,9 +519,12 @@ async def clean_tmp(user_id: int, keep_last: int = 0):
             await bot.delete_message(chat_id=user_id, message_id=int(mid))
         except Exception:
             pass
-    await redis.delete(key)
-    for mid in keep:
-        await redis.rpush(key, mid)
+    try:
+        await redis.delete(key)
+        for mid in keep:
+            await redis.rpush(key, mid)
+    except Exception as e:
+        _log_redis_write_error(f"clean_tmp:{key}", e)
 
 # ===================== Состояния =====================
 
@@ -2890,8 +2930,19 @@ async def cb_take(cq: CallbackQuery):
         topic_id = topic.message_thread_id
 
         # 3) Сохраняем связь тема ↔ клиент
-        await redis.set(THREAD_TO_CLIENT.format(tid=topic_id), client_id)
-        await redis.set(CLIENT_TO_THREAD.format(uid=client_id), topic_id)
+        try:
+            await redis.set(THREAD_TO_CLIENT.format(tid=topic_id), client_id)
+            await redis.set(CLIENT_TO_THREAD.format(uid=client_id), topic_id)
+        except Exception as e:
+            _log_redis_write_error(f"cb_take:topic_link:{topic_id}:{client_id}", e)
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=topic_id,
+                text=(
+                    "⚠️ Не удалось сохранить связь тема↔клиент в Redis. "
+                    "Проверьте REDIS_URL (должен указывать на master)."
+                ),
+            )
 
         # 4) Обновляем карточку и даём инструкции менеджеру
         try:
