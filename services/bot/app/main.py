@@ -24,6 +24,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from aiogram.exceptions import (
     TelegramMigrateToChat,
@@ -130,6 +133,8 @@ class QuoteDraft:
     cargo_text: Optional[str] = None
     weight_text: Optional[str] = None
     volume_text: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_tg: Optional[str] = None
     quote_id: Optional[int] = None
 
 
@@ -284,6 +289,10 @@ def render_simple_calc_application(
         rows.append(f"Вес: {d.weight_text}")
     if d.volume_text:
         rows.append(f"Объём: {d.volume_text}")
+    if d.contact_phone:
+        rows.append(f"Контакт: {d.contact_phone}")
+    if d.contact_tg:
+        rows.append(f"Telegram: {d.contact_tg}")
 
     # блок ставки – только на финальном шаге
     if rate_rub is not None:
@@ -558,6 +567,7 @@ class CalcFlow(StatesGroup):
     VOLUME = State()
     VOLUME_CUSTOM = State()
     FTL_MODE = State()
+    CONTACT = State()
     REVIEW = State()
     EDIT_FIELD = State()
     CALCULATING = State()
@@ -630,6 +640,17 @@ def kb_calc_review():
         [InlineKeyboardButton(text="Изменить", callback_data="calc:edit")],
         [InlineKeyboardButton(text="Главное меню", callback_data="back:menu")],
     ])
+
+
+def kb_contact_request():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Оставить контакт", request_contact=True)],
+            [KeyboardButton(text="Главное меню")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 def kb_ask_question():
     return InlineKeyboardMarkup(
@@ -2507,25 +2528,72 @@ async def calc_ftl_mode(cq: CallbackQuery, state: FSMContext):
             log.warning("Не удалось удалить шапку в calc_ftl_mode: %s", header_id)
 
 
-    # переходим в состояние REVIEW и чистим временные сообщения
-    await state.set_state(CalcFlow.REVIEW)
+    # шаг контакта перед подтверждением заявки
+    await state.set_state(CalcFlow.CONTACT)
     await clean_tmp(cq.from_user.id)
-
-    # собираем актуальный драфт и показываем ревью
-    d = QuoteDraft(**(await state.get_data())["draft"])
-    preview = render_simple_calc_application(
-        d,
-        rate_rub=None,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-    )
-
     await send_tmp_by_id(
         cq.from_user.id,
+        "Оставьте ваш контактный номер для связи.",
+        reply_markup=kb_contact_request(),
+    )
+    await cq.answer()
+
+
+@router.message(CalcFlow.CONTACT, F.contact)
+async def calc_contact_shared(m: Message, state: FSMContext):
+    data = await state.get_data()
+    draft = QuoteDraft(**data.get("draft", {}))
+
+    phone = (m.contact.phone_number or "").strip()
+    tg_handle = (
+        f"@{m.from_user.username}"
+        if m.from_user and m.from_user.username
+        else (m.from_user.full_name if m.from_user else "-")
+    )
+
+    draft.contact_phone = phone or draft.contact_phone
+    draft.contact_tg = tg_handle
+    await state.update_data(draft=asdict(draft))
+
+    await save_client_history(
+        m.from_user.id,
+        "контакт",
+        f"Телефон: {draft.contact_phone or '-'}; Telegram: {draft.contact_tg or '-'}",
+    )
+
+    await m.answer("Спасибо! Контакт сохранён.", reply_markup=ReplyKeyboardRemove())
+
+    await state.set_state(CalcFlow.REVIEW)
+    await clean_tmp(m.from_user.id)
+
+    preview = render_simple_calc_application(
+        draft,
+        rate_rub=None,
+        user_name=m.from_user.full_name,
+        user_id=m.from_user.id,
+    )
+
+    await send_tmp(
+        m,
         preview,
         reply_markup=kb_calc_review(),
     )
-    await cq.answer()
+
+
+@router.message(CalcFlow.CONTACT, F.text == "Главное меню")
+async def calc_contact_back_to_menu(m: Message, state: FSMContext):
+    await state.clear()
+    await clean_tmp(m.from_user.id)
+    await m.answer("Возвращаю в главное меню.", reply_markup=ReplyKeyboardRemove())
+    await send_tmp(m, "Выберите действие:", reply_markup=kb_main())
+
+
+@router.message(CalcFlow.CONTACT)
+async def calc_contact_invalid(m: Message):
+    await m.answer(
+        "Нажмите кнопку «Оставить контакт», чтобы отправить номер автоматически.",
+        reply_markup=kb_contact_request(),
+    )
 
 
 @router.callback_query(F.data == "calc:edit", CalcFlow.REVIEW)
