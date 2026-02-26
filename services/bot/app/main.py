@@ -24,6 +24,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 from aiogram.exceptions import (
     TelegramMigrateToChat,
@@ -31,6 +34,7 @@ from aiogram.exceptions import (
     TelegramForbiddenError,
 )
 from redis.asyncio import Redis
+from redis.exceptions import ReadOnlyError
 
 from aiogram.client.default import DefaultBotProperties
 
@@ -38,6 +42,8 @@ from datetime import date, timedelta
 
 from aiogram.types import FSInputFile
 
+from app.geo import distance_km
+from app.hub_fallback import HubFallbackResult, hub_fallback_pipeline
 
 
 
@@ -84,6 +90,7 @@ USER_TMP_STACK = "tmpmsgs:{uid}"  # список message_id, чтобы чист
 # --- Redis key templates ---
 THREAD_TO_CLIENT = "thread_to_client:{tid}"
 CLIENT_TO_THREAD = "client_to_thread:{uid}"
+CLIENT_HISTORY = "client_history:{uid}"
 
 # ===================== Доменные модели =====================
 
@@ -126,6 +133,8 @@ class QuoteDraft:
     cargo_text: Optional[str] = None
     weight_text: Optional[str] = None
     volume_text: Optional[str] = None
+    contact_phone: Optional[str] = None
+    contact_tg: Optional[str] = None
     quote_id: Optional[int] = None
 
 
@@ -194,11 +203,59 @@ def render_application(d: QuoteDraft, rate_rub: Optional[int], user_name: str = 
     rows.append("ℹ️ Это ориентировочная ставка. Для точного расчёта подключим логиста.")
     return "\n".join(rows)
 
+
+
+def _city_display(name: str) -> str:
+    city = (name or "").strip()
+    return city.title() if city else "—"
+
+
+def _city_after_do(name: str) -> str:
+    city = _city_display(name)
+    low = city.lower()
+
+    if low.endswith("ск"):
+        return city + "а"
+    if low.endswith("бург"):
+        return city + "а"
+    if low.endswith("ь"):
+        return city[:-1] + "и"
+    if low.endswith("а"):
+        return city[:-1] + "ы"
+    if low.endswith("я"):
+        return city[:-1] + "и"
+    return city
+
+
+def build_hub_synthetic_note(hub_result: HubFallbackResult) -> str:
+    tail_cost = max(0, int(round(hub_result.synthetic_rate_rub - hub_result.base_rate_rub)))
+
+    base_from, base_to = "—", "—"
+    if "→" in (hub_result.base_route or ""):
+        left, right = hub_result.base_route.split("→", 1)
+        base_from, base_to = _city_display(left), _city_display(right)
+
+    base_rate = int(round(hub_result.base_rate_rub))
+
+    base_from_low = base_from.lower()
+    hub_low = (hub_result.hub_city or "").strip().lower()
+    if base_from_low.startswith(hub_low):
+        tail_city = _city_display(hub_result.from_city)
+    else:
+        tail_city = _city_display(hub_result.to_city)
+
+    return (
+        f"Маршрут через {_city_display(hub_result.hub_city)} "
+        f"(стоимость {base_from} - {base_to}: {fmt_rub(base_rate)}), "
+        f"плюс стоимость до {_city_after_do(tail_city)} ({fmt_rub(tail_cost)})"
+    )
+
 def render_simple_calc_application(
     d: QuoteDraft,
     rate_rub: Optional[int],
     user_name: str = "",
     user_id: Optional[int] = None,
+    synthetic_note: Optional[str] = None,
 ) -> str:
     """
     Простой шаблон для новой линейки:
@@ -232,12 +289,18 @@ def render_simple_calc_application(
         rows.append(f"Вес: {d.weight_text}")
     if d.volume_text:
         rows.append(f"Объём: {d.volume_text}")
+    if d.contact_phone:
+        rows.append(f"Контакт: {d.contact_phone}")
+    if d.contact_tg:
+        rows.append(f"Telegram: {d.contact_tg}")
 
     # блок ставки – только на финальном шаге
     if rate_rub is not None:
         rows.append("")
         rows.append("💰 Оценка ставки: от " + fmt_rub(rate_rub))
         rows.append("ℹ️ Это ориентировочная ставка. Для точного расчёта подключим логиста.")
+        if synthetic_note:
+            rows.append(f"⚠️ {synthetic_note}")
 
     return "\n".join(rows)
 
@@ -263,23 +326,98 @@ _ATI_CITY_CACHE_LOADED = False
 async def _get_inbox_thread_id() -> Optional[int]:
     if TOPIC_INBOX:
         return TOPIC_INBOX
-    val = await redis.get(R_INBOX_TOPIC)
+    try:
+        val = await redis.get(R_INBOX_TOPIC)
+    except Exception as e:
+        log.warning("redis get inbox topic failed: %s", e)
+        return None
     try:
         return int(val) if val else None
     except Exception:
         return None
 
+
+def _is_readonly_redis_error(exc: Exception) -> bool:
+    if isinstance(exc, ReadOnlyError):
+        return True
+    return "read only replica" in str(exc).lower()
+
+
+def _log_redis_write_error(action: str, exc: Exception) -> None:
+    if _is_readonly_redis_error(exc):
+        log.error(
+            "Redis write skipped (%s): read-only replica. Check REDIS_URL and point bot to writable master.",
+            action,
+        )
+    else:
+        log.warning("Redis write failed (%s): %s", action, exc)
+
 async def send_tmp(m: Message, text: str, **kwargs) -> Message:
     msg = await m.answer(text, **kwargs)
     key = USER_TMP_STACK.format(uid=m.from_user.id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp:{key}", e)
     return msg
 
 async def send_tmp_by_id(chat_id: int, text: str, **kwargs) -> Message:
     msg = await bot.send_message(chat_id, text, **kwargs)
     key = USER_TMP_STACK.format(uid=chat_id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp_by_id:{key}", e)
     return msg
+
+
+def _history_line(kind: str, text: str) -> str:
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    body = (text or "").replace("\n", " ").strip()
+    if len(body) > 380:
+        body = body[:377] + "..."
+    return f"[{stamp}] {kind}: {body}"
+
+
+def _build_calc_history_summary(d: QuoteDraft, method: str, rate_rub: Optional[int]) -> str:
+    quote = f"#{d.quote_id}" if getattr(d, "quote_id", None) else "без номера"
+    route = f"{(d.route_from or '—').strip()} → {(d.route_to or '—').strip()}"
+
+    method_map = {
+        "ati": "ATI",
+        "hub_fallback": "HUB",
+        "fallback": "заглушка",
+        "gpt_fallback": "заглушка",
+    }
+    method_label = method_map.get(method, method)
+
+    if rate_rub is None:
+        return f"Просчёт {quote}: {route}; метод={method_label}; ставка: несколько вариантов"
+
+    return f"Просчёт {quote}: {route}; метод={method_label}; ставка: от {fmt_rub(rate_rub)}"
+
+
+async def save_client_history(user_id: int, kind: str, text: str) -> None:
+    key = CLIENT_HISTORY.format(uid=user_id)
+    try:
+        await redis.rpush(key, _history_line(kind, text))
+        await redis.ltrim(key, -25, -1)
+    except Exception as e:
+        _log_redis_write_error(f"save_client_history:{key}", e)
+
+
+async def build_client_history_text(user_id: int, limit: int = 10) -> Optional[str]:
+    try:
+        key = CLIENT_HISTORY.format(uid=user_id)
+        items = await redis.lrange(key, -limit, -1)
+    except Exception as e:
+        log.warning("build_client_history_text failed for %s: %s", user_id, e)
+        return None
+
+    if not items:
+        return None
+
+    return "📚 История по клиенту:\n" + "\n".join(f"• {x}" for x in items)
 
 from aiogram.types import FSInputFile, Message
 
@@ -293,7 +431,10 @@ async def send_tmp_photo(
     msg = await m.answer_photo(photo, caption=caption, **kwargs)
 
     key = USER_TMP_STACK.format(uid=m.from_user.id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp_photo:{key}", e)
 
     return msg
 
@@ -313,7 +454,10 @@ async def send_tmp_photo_by_user_id(
     )
 
     key = USER_TMP_STACK.format(uid=user_id)
-    await redis.rpush(key, msg.message_id)
+    try:
+        await redis.rpush(key, msg.message_id)
+    except Exception as e:
+        _log_redis_write_error(f"send_tmp_photo_by_user_id:{key}", e)
 
     return msg
 
@@ -367,7 +511,11 @@ async def ensure_quote_header(user_id: int, state: FSMContext) -> None:
 
 async def clean_tmp(user_id: int, keep_last: int = 0):
     key = USER_TMP_STACK.format(uid=user_id)
-    ids = await redis.lrange(key, 0, -1)
+    try:
+        ids = await redis.lrange(key, 0, -1)
+    except Exception as e:
+        log.warning("clean_tmp redis read failed for %s: %s", user_id, e)
+        return
     if not ids:
         return
     if keep_last > 0:
@@ -380,9 +528,12 @@ async def clean_tmp(user_id: int, keep_last: int = 0):
             await bot.delete_message(chat_id=user_id, message_id=int(mid))
         except Exception:
             pass
-    await redis.delete(key)
-    for mid in keep:
-        await redis.rpush(key, mid)
+    try:
+        await redis.delete(key)
+        for mid in keep:
+            await redis.rpush(key, mid)
+    except Exception as e:
+        _log_redis_write_error(f"clean_tmp:{key}", e)
 
 # ===================== Состояния =====================
 
@@ -416,6 +567,7 @@ class CalcFlow(StatesGroup):
     VOLUME = State()
     VOLUME_CUSTOM = State()
     FTL_MODE = State()
+    CONTACT = State()
     REVIEW = State()
     EDIT_FIELD = State()
     CALCULATING = State()
@@ -488,6 +640,17 @@ def kb_calc_review():
         [InlineKeyboardButton(text="Изменить", callback_data="calc:edit")],
         [InlineKeyboardButton(text="Главное меню", callback_data="back:menu")],
     ])
+
+
+def kb_contact_request():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Оставить контакт", request_contact=True)],
+            [KeyboardButton(text="Главное меню")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
 
 def kb_ask_question():
     return InlineKeyboardMarkup(
@@ -588,18 +751,14 @@ def kb_rate_result():
 
 
 
+
 # ===================== Заглушка расчёта ставки (до ATI) =====================
 
 async def simple_rate_fallback(draft: QuoteDraft) -> int:
     """
-    ВРЕМЕННО: простая заглушка, пока не подключён ATI.
-
-    Здесь будет новый pipeline:
-    - GPT нормализует заявку (города, кузов, тоннаж)
-    - ATI возвращает рыночные ставки
-    - GPT красиво оформляет ответ
-
-    Сейчас просто возвращаем фиксированную цифру.
+    Резервная заглушка: вернуть базовую оценку,
+    если ATI и hub fallback не дали результата.
+    Нужна, чтобы клиент получил ответ и мог оставить контакт.
     """
     return 50000
 
@@ -636,6 +795,7 @@ async def mode_ask(cq: CallbackQuery, state: FSMContext):
 
 @router.message(Flow.JUST_ASK_INPUT, F.text.len() > 0)
 async def just_ask_input(m: Message, state: FSMContext):
+    await save_client_history(m.from_user.id, "вопрос", m.text)
     # 1) отправляем запрос во внутренний API (как раньше)
     payload = {
         "tg_id": str(m.from_user.id),
@@ -709,6 +869,7 @@ async def mode_call(cq: CallbackQuery, state: FSMContext):
 @router.message(CallFlow.CALLBACK_PHONE, F.text.len() > 0)
 async def callback_phone(m: Message, state: FSMContext):
     phone = m.text.strip()
+    await save_client_history(m.from_user.id, "звонок", f"Запросил звонок: {phone}")
 
     # 1) Шлём тикет во внутренний API
     payload = {
@@ -1027,119 +1188,17 @@ async def review_edit(cq: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "review:confirm", Flow.REVIEW)
 async def review_confirm(cq: CallbackQuery, state: FSMContext):
-
-    await state.set_state(Flow.RATE)
-
-    # временное сообщение «считаем»
-    calc_msg = await send_tmp_by_id(
-        cq.from_user.id,
-        "Считаем ставку по вашей заявке…"
-    )
-
+    """
+    Legacy-путь подтверждения. Делегируем в единый сценарий calc_confirm,
+    чтобы не дублировать расчёт/fallback/историю/карточку менеджерам в двух местах.
+    """
     data = await state.get_data()
-    d = QuoteDraft(**data["draft"])
+    if "draft" not in data:
+        await cq.answer("Не удалось найти заявку, попробуйте заново", show_alert=True)
+        return
 
-    txt: str
-    rate_for_state = None
-    calc_status = "unknown"
-
-    # ==============================
-    # 1) Пробуем полный ATI pipeline
-    # ==============================
-    ati_result = await ati_full_pipeline_simple(d)
-
-    if ati_result and ati_result.get("rates"):
-        # есть ставки по нескольким кузовам → красивый текст
-        txt = await gpt_render_final_rate_simple(
-            draft=d,
-            rates=ati_result["rates"],
-            user=cq.from_user,
-        )
-        rate_for_state = None
-        calc_status = "ati"
-    else:
-    # ==============================
-    # 2) Фолбэк: одна цифра (HUB отключён)
-    # ==============================
-     rate = await gpt_estimate_rate(d)
-     if rate is None:
-        rate = 50000
-
-     txt = render_simple_calc_application(
-        d,
-        rate,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-     )
-     rate_for_state = rate
-     calc_status = "gpt"
-
-
-    # удаляем сообщение «считаем»
-    try:
-        await bot.delete_message(
-            chat_id=cq.from_user.id,
-            message_id=calc_msg.message_id
-        )
-    except Exception:
-        pass
-
-    # чистим временные сообщения
-    await clean_tmp(cq.from_user.id)
-
-    # ==============================
-    # 4) Клиенту
-    # ==============================
-    await bot.send_message(
-        cq.from_user.id,
-        txt,
-        reply_markup=kb_rate_result(),
-    )
-
-    # ==============================
-    # 5) Менеджерам — ТО ЖЕ САМОЕ + статус
-    # ==============================
-    inbox_tid = await _get_inbox_thread_id()
-    kb_inbox = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Взять клиента",
-                    callback_data=f"take:calc:{cq.from_user.id}"
-                )
-            ]
-        ]
-    )
-
-    status_map = {
-        "ati": "ATI (есть статистика)",
-        "hub": "HUB (восстановлено через хаб)",
-        "gpt": "GPT (оценка одной цифрой)",
-        "unknown": "UNKNOWN",
-    }
-    card = txt + f"\n\nСтатус: был только просчёт\nМетод: {status_map.get(calc_status, calc_status)}"
-
-    try:
-        await bot.send_message(
-            chat_id=MANAGER_GROUP_ID,
-            text=card,
-            reply_markup=kb_inbox,
-            message_thread_id=inbox_tid,
-        )
-    except TelegramMigrateToChat as e:
-        await bot.send_message(
-            chat_id=e.migrate_to_chat_id,
-            text=card,
-            reply_markup=kb_inbox,
-            message_thread_id=inbox_tid,
-        )
-
-    # сохраняем avg_rate ТОЛЬКО если была одна цифра
-    if rate_for_state is not None:
-        d.avg_rate = rate_for_state
-        await state.update_data(draft=asdict(d))
-
-    await cq.answer()
+    await state.set_state(CalcFlow.REVIEW)
+    await calc_confirm(cq, state)
 
 
 from openai import AsyncOpenAI
@@ -1729,7 +1788,7 @@ def _ati_normalize_cartype(car_type: str) -> str:
 from datetime import date, timedelta
 from typing import Optional
 
-async def ati_fetch_rate_single(
+async def _ati_fetch_prices_in_rub(
     *,
     from_city_id: int,
     to_city_id: int,
@@ -1740,13 +1799,7 @@ async def ati_fetch_rate_single(
     round_trip: bool = False,
 ) -> Optional[dict]:
     """
-    СТРОГО как считает сайт ATI.
-
-    КЛЮЧЕВОЕ:
-    - Frequency = "day"
-    - DateFrom / DateTo
-    - Берём ТОЛЬКО PricesInRub.AveragePrice
-    - НИКАКИХ умножений
+    Возвращает PricesInRub из ATI average_prices без модификаций.
     """
 
     if not ATI_API_TOKEN:
@@ -1793,13 +1846,84 @@ async def ati_fetch_rate_single(
     if not isinstance(avg, (int, float)):
         return None
 
+    return prices
+
+
+async def ati_fetch_rate_single(
+    *,
+    from_city_id: int,
+    to_city_id: int,
+    car_type: str,
+    tonnage: float,
+    with_nds: bool,
+    days_back: int = 14,          # 👈 как на сайте
+    round_trip: bool = False,
+) -> Optional[dict]:
+    """
+    СТРОГО как считает сайт ATI.
+
+    КЛЮЧЕВОЕ:
+    - Frequency = "day"
+    - DateFrom / DateTo
+    - Берём ТОЛЬКО PricesInRub.AveragePrice
+    - НИКАКИХ умножений
+    """
+    prices = await _ati_fetch_prices_in_rub(
+        from_city_id=from_city_id,
+        to_city_id=to_city_id,
+        car_type=car_type,
+        tonnage=tonnage,
+        with_nds=with_nds,
+        days_back=days_back,
+        round_trip=round_trip,
+    )
+    if not prices:
+        return None
+
+    avg = prices.get("AveragePrice")
+    if not isinstance(avg, (int, float)):
+        return None
+
     return {
-        "car_type": car,
+        "car_type": _ati_normalize_cartype(car_type),
         "with_nds": with_nds,
-        "tonnage": tonnage_value,
+        "tonnage": normalize_ati_tonnage(tonnage),
         "rate_from": int(round(avg)),
         "rate_to": int(round(prices.get("UpperPrice", avg))),
     }
+
+
+async def ati_fetch_average_price_raw(
+    *,
+    from_city_id: int,
+    to_city_id: int,
+    car_type: str,
+    tonnage: float,
+    with_nds: bool,
+    days_back: int = 14,
+    round_trip: bool = False,
+) -> Optional[float]:
+    """
+    Возвращает PricesInRub.AveragePrice как есть (без модификаций).
+    Используется для hub fallback, чтобы не загрязнять основной ATI pipeline.
+    """
+    prices = await _ati_fetch_prices_in_rub(
+        from_city_id=from_city_id,
+        to_city_id=to_city_id,
+        car_type=car_type,
+        tonnage=tonnage,
+        with_nds=with_nds,
+        days_back=days_back,
+        round_trip=round_trip,
+    )
+    if not prices:
+        return None
+
+    avg = prices.get("AveragePrice")
+    if not isinstance(avg, (int, float)):
+        return None
+
+    return float(avg)
 
 
 async def ati_collect_full_rates(
@@ -1853,7 +1977,6 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
       3) Нормализуем тоннаж в 1.5/3/5/10/20
       4) Берём доступные кузова для направления+тоннажа из v2/all_directions
       5) Делаем N запросов average_prices (по одному на кузов и НДС/без НДС)
-      6) Если ставок нет — просим GPT подобрать хабы и повторяем по хабам (быстро, с лимитом)
     """
     if not oai_client or not ATI_API_TOKEN:
         log.warning("ATI pipeline: нет OpenAI клиента или ATI токена")
@@ -2031,7 +2154,7 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
     # ----------------------------
     # First: try original route (fast)
     # ----------------------------
-    GLOBAL_BUDGET = 24  # общий лимит запросов average_prices за весь пайплайн (оригинал + хабы)
+    GLOBAL_BUDGET = 24  # общий лимит запросов average_prices за весь пайплайн
     result, GLOBAL_BUDGET, last_empty = await _run_attempts_for_route(
         from_city_name=from_city,
         to_city_name=to_city,
@@ -2042,6 +2165,76 @@ async def ati_full_pipeline_simple(draft: QuoteDraft) -> Optional[dict]:
     )
     if result:
         return result
+
+
+async def estimate_rate(draft: QuoteDraft) -> Optional[dict]:
+    """
+    Estimate rate:
+      1) ati_full_pipeline_simple(A→B)
+      2) if rates exist — return them
+      3) if no rates — hub_fallback_pipeline(draft)
+    """
+    log.info(
+        "ESTIMATE_RATE ENTER from=%s to=%s quote_id=%s",
+        draft.route_from,
+        draft.route_to,
+        getattr(draft, "quote_id", None),
+    )
+    ati_result = await ati_full_pipeline_simple(draft)
+    rates = ati_result.get("rates") if isinstance(ati_result, dict) else None
+    rates_count = len(rates) if isinstance(rates, list) else 0
+    log.info("ESTIMATE_RATE ATI rates_count=%s", rates_count)
+    if rates_count > 0:
+        return {"kind": "ati", "ati_result": ati_result}
+
+    log.info("ESTIMATE_RATE FALLBACK START reason=no_rates")
+
+    norm = await gpt_prepare_ati_request(draft)
+    if not norm:
+        log.warning("Hub fallback: GPT нормализация не удалась")
+        return None
+
+    from_city = (norm.get("from_city") or draft.route_from or "").strip()
+    to_city = (norm.get("to_city") or draft.route_to or "").strip()
+    if not from_city or not to_city:
+        log.warning("Hub fallback: нет городов (%r → %r)", from_city, to_city)
+        return None
+
+    raw_tonnage = norm.get("tonnage")
+    if raw_tonnage is None:
+        try:
+            if draft.truck_class:
+                raw_tonnage = float(str(draft.truck_class).replace(",", "."))
+        except Exception:
+            raw_tonnage = None
+
+    tonnage = normalize_ati_tonnage(raw_tonnage or 20)
+
+    raw_car_types = norm.get("car_types") or []
+    car_types = [_ati_normalize_cartype(x) for x in raw_car_types if x]
+    if not car_types:
+        car_types = ["tent", "close"]
+
+    hub_result = await hub_fallback_pipeline(
+        from_city=from_city,
+        to_city=to_city,
+        tonnage=tonnage,
+        car_types=car_types,
+        resolve_city_id=ati_resolve_city_id,
+        fetch_average_price=ati_fetch_average_price_raw,
+        distance_km=distance_km,
+        logger=log,
+    )
+    if hub_result:
+        log.warning(
+            "Hub fallback used: %s→%s via %s",
+            from_city,
+            to_city,
+            hub_result.hub_city,
+        )
+        return {"kind": "hub_fallback", "hub_result": hub_result}
+
+    return None
 
 
 async def estimate_rate_via_ati(draft: QuoteDraft) -> Optional[int]:
@@ -2335,25 +2528,72 @@ async def calc_ftl_mode(cq: CallbackQuery, state: FSMContext):
             log.warning("Не удалось удалить шапку в calc_ftl_mode: %s", header_id)
 
 
-    # переходим в состояние REVIEW и чистим временные сообщения
-    await state.set_state(CalcFlow.REVIEW)
+    # шаг контакта перед подтверждением заявки
+    await state.set_state(CalcFlow.CONTACT)
     await clean_tmp(cq.from_user.id)
-
-    # собираем актуальный драфт и показываем ревью
-    d = QuoteDraft(**(await state.get_data())["draft"])
-    preview = render_simple_calc_application(
-        d,
-        rate_rub=None,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-    )
-
     await send_tmp_by_id(
         cq.from_user.id,
+        "Оставьте ваш контактный номер для связи.",
+        reply_markup=kb_contact_request(),
+    )
+    await cq.answer()
+
+
+@router.message(CalcFlow.CONTACT, F.contact)
+async def calc_contact_shared(m: Message, state: FSMContext):
+    data = await state.get_data()
+    draft = QuoteDraft(**data.get("draft", {}))
+
+    phone = (m.contact.phone_number or "").strip()
+    tg_handle = (
+        f"@{m.from_user.username}"
+        if m.from_user and m.from_user.username
+        else (m.from_user.full_name if m.from_user else "-")
+    )
+
+    draft.contact_phone = phone or draft.contact_phone
+    draft.contact_tg = tg_handle
+    await state.update_data(draft=asdict(draft))
+
+    await save_client_history(
+        m.from_user.id,
+        "контакт",
+        f"Телефон: {draft.contact_phone or '-'}; Telegram: {draft.contact_tg or '-'}",
+    )
+
+    await m.answer("Спасибо! Контакт сохранён.", reply_markup=ReplyKeyboardRemove())
+
+    await state.set_state(CalcFlow.REVIEW)
+    await clean_tmp(m.from_user.id)
+
+    preview = render_simple_calc_application(
+        draft,
+        rate_rub=None,
+        user_name=m.from_user.full_name,
+        user_id=m.from_user.id,
+    )
+
+    await send_tmp(
+        m,
         preview,
         reply_markup=kb_calc_review(),
     )
-    await cq.answer()
+
+
+@router.message(CalcFlow.CONTACT, F.text == "Главное меню")
+async def calc_contact_back_to_menu(m: Message, state: FSMContext):
+    await state.clear()
+    await clean_tmp(m.from_user.id)
+    await m.answer("Возвращаю в главное меню.", reply_markup=ReplyKeyboardRemove())
+    await send_tmp(m, "Выберите действие:", reply_markup=kb_main())
+
+
+@router.message(CalcFlow.CONTACT)
+async def calc_contact_invalid(m: Message):
+    await m.answer(
+        "Нажмите кнопку «Оставить контакт», чтобы отправить номер автоматически.",
+        reply_markup=kb_contact_request(),
+    )
 
 
 @router.callback_query(F.data == "calc:edit", CalcFlow.REVIEW)
@@ -2581,12 +2821,13 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
     log.warning("DEBUG GPT → ATI Draft: %s", d)
     log.warning("CAR TYPES FOR ATI: %s", d.car_types)
 
-    ati_result = await ati_full_pipeline_simple(d)
+    estimate_result = await estimate_rate(d)
     approx_rate_for_crm: Optional[int] = None
     calc_method = "unknown"  # для менеджеров/логов
 
-    if ati_result and ati_result.get("rates"):
+    if estimate_result and estimate_result.get("kind") == "ati":
         # --- ATI OK ---
+        ati_result = estimate_result["ati_result"]
         rates = ati_result["rates"]
         calc_method = "ati"
 
@@ -2615,19 +2856,34 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
 
         client_text = header_text + "\n\n" + rates_text
 
+    elif estimate_result and estimate_result.get("kind") == "hub_fallback":
+        hub_result: HubFallbackResult = estimate_result["hub_result"]
+        calc_method = "hub_fallback"
+
+        fallback_rate = int(round(hub_result.synthetic_rate_rub))
+        approx_rate_for_crm = fallback_rate
+
+        client_text = render_simple_calc_application(
+            d,
+            fallback_rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+            synthetic_note=build_hub_synthetic_note(hub_result),
+        )
     else:
-     # --- ATI EMPTY → простой fallback (HUB отключён для прода) ---
-     calc_method = "gpt_fallback"
+        # --- ATI EMPTY + HUB EMPTY → базовая заглушка ---
+        calc_method = "gpt_fallback"
 
-     fallback_rate = await simple_rate_fallback(d)
-     approx_rate_for_crm = fallback_rate
+        fallback_rate = await simple_rate_fallback(d)
+        approx_rate_for_crm = fallback_rate
 
-     client_text = render_simple_calc_application(
-        d,
-        fallback_rate,
-        user_name=cq.from_user.full_name,
-        user_id=cq.from_user.id,
-     )
+        client_text = render_simple_calc_application(
+            d,
+            fallback_rate,
+            user_name=cq.from_user.full_name,
+            user_id=cq.from_user.id,
+        )
+        client_text += "\n\n⚠️ ATI и hub fallback не дали ставку; показана базовая заглушка."
 
 
     # =====================================================================
@@ -2649,6 +2905,11 @@ async def calc_confirm(cq: CallbackQuery, state: FSMContext):
         cq.from_user.id,
         client_text,
         reply_markup=kb_rate_result(),
+    )
+    await save_client_history(
+        cq.from_user.id,
+        "просчёт",
+        _build_calc_history_summary(d, calc_method, approx_rate_for_crm),
     )
 
     # 📸 10.1) Финальная картинка
@@ -2737,8 +2998,19 @@ async def cb_take(cq: CallbackQuery):
         topic_id = topic.message_thread_id
 
         # 3) Сохраняем связь тема ↔ клиент
-        await redis.set(THREAD_TO_CLIENT.format(tid=topic_id), client_id)
-        await redis.set(CLIENT_TO_THREAD.format(uid=client_id), topic_id)
+        try:
+            await redis.set(THREAD_TO_CLIENT.format(tid=topic_id), client_id)
+            await redis.set(CLIENT_TO_THREAD.format(uid=client_id), topic_id)
+        except Exception as e:
+            _log_redis_write_error(f"cb_take:topic_link:{topic_id}:{client_id}", e)
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=topic_id,
+                text=(
+                    "⚠️ Не удалось сохранить связь тема↔клиент в Redis. "
+                    "Проверьте REDIS_URL (должен указывать на master)."
+                ),
+            )
 
         # 4) Обновляем карточку и даём инструкции менеджеру
         try:
@@ -2746,14 +3018,32 @@ async def cb_take(cq: CallbackQuery):
         except Exception:
             pass
 
+        intro_text = (
+            "Диалог по заявке открыт. Пишите в этой теме — клиент будет получать сообщения.\n"
+            "Для завершения напишите /close"
+        )
         await bot.send_message(
             chat_id=MANAGER_GROUP_ID,
             message_thread_id=topic_id,
-            text=(
-                "Диалог по заявке открыт. Пишите в этой теме — клиент будет получать сообщения.\n"
-                "Для завершения напишите /close"
-            ),
+            text=intro_text,
         )
+
+        # Текущий просчёт/вопрос из карточки + история клиента
+        card_text = (cq.message.text or "").strip()
+        if card_text:
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=topic_id,
+                text="🧾 Актуальная карточка:\n" + card_text,
+            )
+
+        history_text = await build_client_history_text(client_id, limit=10)
+        if history_text:
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=topic_id,
+                text=history_text,
+            )
         await cq.answer("Тикет назначен вам")
     except TelegramBadRequest as e:
         # Частый кейс: темы выключены в группе
@@ -2771,6 +3061,9 @@ async def cb_take(cq: CallbackQuery):
 async def relay_from_manager(m: Message):
     if m.chat.id != MANAGER_GROUP_ID:
         return
+    # сообщения самого бота не релеим обратно клиенту
+    if m.from_user and m.from_user.id == (await bot.get_me()).id:
+        return
     # нужно отвечать в теме (thread)
     tid = getattr(m, "message_thread_id", None)
     if not tid:
@@ -2782,14 +3075,96 @@ async def relay_from_manager(m: Message):
         client_id = int(client_id_str)
         # Текст/медиа
         if m.text:
-            await bot.send_message(client_id, m.text, parse_mode="HTML")
+            await bot.send_message(client_id, m.text)
         elif m.photo:
-            await bot.send_photo(client_id, m.photo[-1].file_id, caption=m.caption or "", parse_mode="HTML")
+            await bot.send_photo(client_id, m.photo[-1].file_id, caption=m.caption or "")
         elif m.document:
-            await bot.send_document(client_id, m.document.file_id, caption=m.caption or "", parse_mode="HTML")
+            await bot.send_document(client_id, m.document.file_id, caption=m.caption or "")
+        elif m.voice:
+            await bot.send_voice(client_id, m.voice.file_id, caption=m.caption or "")
+        elif m.audio:
+            await bot.send_audio(client_id, m.audio.file_id, caption=m.caption or "")
+        elif m.video:
+            await bot.send_video(client_id, m.video.file_id, caption=m.caption or "")
+        else:
+            log.info("relay: unsupported message type in tid=%s from=%s", tid, m.from_user.id if m.from_user else None)
+            return
+
+        log.info("relay: delivered manager message tid=%s -> client=%s", tid, client_id)
         # (Если нужно — добавить пересылку фото/доков: get_file → download → send_document)
     except Exception as e:
         log.warning("Не удалось переслать клиенту из темы %s: %s", tid, e)
+
+
+@router.message(F.chat.type == "private")
+async def relay_from_client(m: Message):
+    """
+    Если клиент уже привязан к менеджерскому тикету (topic),
+    дублируем его новые сообщения в соответствующую тему менеджеров.
+    """
+    # системные команды и служебные апдейты тут не трогаем
+    if m.text and m.text.startswith("/"):
+        return
+
+    uid = m.from_user.id if m.from_user else None
+    if not uid:
+        return
+
+    try:
+        tid_str = await redis.get(CLIENT_TO_THREAD.format(uid=uid))
+        if not tid_str:
+            return
+        tid = int(tid_str)
+
+        prefix = f"💬 Клиент {m.from_user.full_name if m.from_user else uid} • TG ID {uid}"
+
+        if m.text:
+            await bot.send_message(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                text=f"{prefix}\n\n{m.text}",
+            )
+        elif m.photo:
+            await bot.send_photo(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                photo=m.photo[-1].file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        elif m.document:
+            await bot.send_document(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                document=m.document.file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        elif m.voice:
+            await bot.send_voice(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                voice=m.voice.file_id,
+                caption=prefix,
+            )
+        elif m.audio:
+            await bot.send_audio(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                audio=m.audio.file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        elif m.video:
+            await bot.send_video(
+                chat_id=MANAGER_GROUP_ID,
+                message_thread_id=tid,
+                video=m.video.file_id,
+                caption=f"{prefix}\n\n{m.caption or ''}".strip(),
+            )
+        else:
+            return
+
+        log.info("relay: delivered client message uid=%s -> tid=%s", uid, tid)
+    except Exception as e:
+        log.warning("Не удалось переслать сообщение клиента %s в тему менеджера: %s", uid, e)
 
 # ===================== Запуск =====================
 
@@ -2826,4 +3201,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
